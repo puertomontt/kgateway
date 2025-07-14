@@ -306,6 +306,16 @@ var _ = DescribeTable("Basic GatewayTranslator Tests",
 				Expect(resolvedRefs.Reason).To(Equal(string(gwv1.RouteReasonResolvedRefs)))
 			},
 		}),
+	FEntry(
+		"tcp gateway with tls",
+		translatorTestCase{
+			inputFile:  "tcp-routing/tls.yaml",
+			outputFile: "tcp-routing/tls.yaml",
+			gwNN: types.NamespacedName{
+				Namespace: "default",
+				Name:      "example-gateway",
+			},
+		}),
 	Entry(
 		"tcproute with missing backend reports correctly",
 		translatorTestCase{

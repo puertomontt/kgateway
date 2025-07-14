@@ -263,15 +263,15 @@ func (ml *MergedListeners) AppendTlsListener(
 	var validRouteInfos []*query.RouteInfo
 
 	for _, routeInfo := range routeInfos {
-		tRoute, ok := routeInfo.Object.(*ir.TlsRouteIR)
-		if !ok {
-			continue
-		}
+		// tRoute, ok := routeInfo.Object.(*ir.TlsRouteIR)
+		// if !ok {
+		// 	continue
+		// }
 
-		if len(tRoute.ParentRefs) == 0 {
-			logger.Warn("no parent references found for TLSRoute", "resource_ref", tRoute.ResourceName())
-			continue
-		}
+		// if len(tRoute.ParentRefs) == 0 {
+		// 	logger.Warn("no parent references found for TLSRoute", "resource_ref", tRoute.ResourceName())
+		// 	continue
+		// }
 
 		validRouteInfos = append(validRouteInfos, routeInfo)
 	}
@@ -425,7 +425,7 @@ func (ml *MergedListener) TranslateListener(
 
 	// Translate TCP listeners (if any exist)
 	for _, tfc := range ml.TcpFilterChains {
-		if tcpListener := tfc.translateTcpFilterChain(ml.listener, ml.name, reporter); tcpListener != nil {
+		if tcpListener := tfc.translateTcpFilterChain(kctx, ctx, ml.gatewayNamespace, ml.listener, queries, ml.name, reporter); tcpListener != nil {
 			matchedTcpListeners = append(matchedTcpListeners, *tcpListener)
 		}
 	}
@@ -462,7 +462,15 @@ type tcpFilterChainParent struct {
 	routesWithHosts     []*query.RouteInfo
 }
 
-func (tc *tcpFilterChain) translateTcpFilterChain(listener ir.Listener, parentName string, reporter reports.Reporter) *ir.TcpIR {
+func (tc *tcpFilterChain) translateTcpFilterChain(
+	kctx krt.HandlerContext,
+	ctx context.Context,
+	gatewayNamespace string,
+	listener ir.Listener,
+	queries query.GatewayQueries,
+	parentName string,
+	reporter reports.Reporter,
+) *ir.TcpIR {
 	parent := tc.parents
 	if len(parent.routesWithHosts) == 0 {
 		return nil
@@ -536,12 +544,29 @@ func (tc *tcpFilterChain) translateTcpFilterChain(listener ir.Listener, parentNa
 			return nil
 		}
 
-		return &ir.TcpIR{
+		sslConfig, err := translateSslConfig(
+			kctx,
+			ctx,
+			gatewayNamespace,
+			tc.tls,
+			queries,
+		)
+		if err != nil {
+			// todo
+		}
+
+		tcpIR := &ir.TcpIR{
 			FilterChainCommon: ir.FilterChainCommon{
 				FilterChainName: tcpHostName,
 			},
 			BackendRefs: backends,
 		}
+
+		if sslConfig != nil {
+			tcpIR.TLS = sslConfig
+		}
+
+		return tcpIR
 	case *ir.TlsRouteIR:
 		tRoute := r.Object.(*ir.TlsRouteIR)
 
