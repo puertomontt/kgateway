@@ -934,6 +934,10 @@ var _ = Describe("Deployer", func() {
 							Name:  "test-gwp",
 						},
 					},
+					Listeners: []gwv1.Listener{{
+						Name: "listener-1",
+						Port: 80,
+					}},
 				},
 			}
 
@@ -979,6 +983,10 @@ var _ = Describe("Deployer", func() {
 							Name:  "test-gwp",
 						},
 					},
+					Listeners: []gwv1.Listener{{
+						Name: "listener-1",
+						Port: 80,
+					}},
 				},
 			}
 

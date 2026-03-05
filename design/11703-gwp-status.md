@@ -1,137 +1,126 @@
-# EP-11703: GatewayParameters Accepted Status
+# EP-11703: GatewayParameters Reference Status
 
 - Issue: [#11703](https://github.com/kgateway-dev/kgateway/issues/11703)
 
-<!-- toc -->
-- [EP-11703: GatewayParameters Accepted Status](#ep-11703-gatewayparameters-accepted-status)
-  - [Background](#background)
-  - [Motivation](#motivation)
-  - [Goals](#goals)
-  - [Non-Goals](#non-goals)
-  - [Implementation Details](#implementation-details)
-    - [Configuration](#configuration)
-    - [Plugin](#plugin)
-    - [Controllers](#controllers)
-    - [Deployer](#deployer)
-    - [Translator and Proxy Syncer](#translator-and-proxy-syncer)
-    - [Reporting](#reporting)
-    - [Test Plan](#test-plan)
-  - [Alternatives](#alternatives)
-  - [Open Questions](#open-questions)
-<!-- /toc -->
-
 ## Background
 
-`GatewayParameters` currently has no object-level status that tells operators whether the object itself is valid.
-Today, invalid `GatewayParameters` values surface indirectly through controller logs and consumer resources (for example, `Gateway` status),
-which makes troubleshooting slower and less explicit when many resources reference the same parameters object.
+`GatewayParameters` previously had no resource-owned status that showed where the object was referenced.
+At the same time, parameter reference failures were surfaced through `Gateway` status (`Accepted=False`, `InvalidParameters`), which tightly coupled reference handling to Gateway reconciliation behavior.
 
-This EP adds a resource-owned status model to `GatewayParameters` so each object reports whether it is accepted.
-The initial implementation scopes status to object validity only, independent of consumer topology.
+This EP changes direction:
+
+- `GatewayParameters` status reports direct references from `Gateway` and `GatewayClass`
+- `GatewayParameters` status does not perform object validation
+- `Gateway` `InvalidParameters` behavior is preserved for deployer parameter-reference/configuration failures
 
 ## Motivation
 
-Operators need direct feedback on whether a `GatewayParameters` object is valid. Object-level status improves day-2 operations by:
+Operators need to quickly answer: "what is currently pointing to this `GatewayParameters` object?"
 
-- reducing time to diagnose invalid deployer inputs
-- making `kubectl get gatewayparameters` immediately actionable
+A direct reference inventory on `GatewayParameters.status` gives this answer while keeping existing `Gateway` invalid-parameter signaling intact.
 
 ## Goals
 
-- Add `GatewayParameters.status.conditions` with a primary `Accepted` condition.
-- Report `Accepted=True` for valid specs and `Accepted=False` for invalid specs.
-- Use reason values `Accepted` and `Invalid`, with concise error messages.
-- Implement a dedicated `GatewayParameters` reconciler to own status updates.
-- Keep status updates idempotent and conflict-safe.
+- Add a structured `GatewayParameters.status.parents[]` field modeled after Gateway API route `parents` status style.
+- Report direct references from:
+  - `Gateway.spec.infrastructure.parametersRef`
+  - `GatewayClass.spec.parametersRef`
+- Include per-parent conditions to indicate direct reference presence.
+- Implement a dedicated `GatewayParameters` reconciler that owns this status.
+- Keep status updates idempotent, sorted, deduplicated, and conflict-safe.
 
 ## Non-Goals
 
-- Aggregating per-consumer outcomes (which `Gateway`/`GatewayClass` references are healthy/unhealthy).
-- Changing existing `Gateway` invalid-parameter status behavior.
-- Adding reference summaries (for example, "used by N Gateways").
-- Adding runtime/environment-dependent validation beyond object-level checks.
+- Validating `GatewayParameters` content in status.
+- Emitting `Accepted=True/False` on `GatewayParameters`.
+- Expanding inherited usage via `GatewayClass` into "effective Gateway usage."
+- Reporting health outcomes of referenced consumers.
 
 ## Implementation Details
 
-### Configuration
+### API
 
-API updates:
+Update `api/v1alpha1/kgateway/gateway_parameters_types.go`:
 
-- Extend `GatewayParametersStatus` in `api/v1alpha1/kgateway/gateway_parameters_types.go` with `Conditions []metav1.Condition`
+- `GatewayParametersStatus` now has:
+  - `parents []gateway.networking.k8s.io/v1.RouteParentStatus`
 
-### Plugin
+Each parent entry includes:
 
-No plugin framework changes are required. 
+- `parentRef`: points to either a `Gateway` or `GatewayClass`
+- `controllerName`: current controller name
+- `conditions`: includes `Referenced=True` with reason `DirectReference`
 
-### Controllers
+### Controller
 
-Add a dedicated reconciler for `GatewayParameters` in `pkg/kgateway/controller/gateway_parameters.go` and register it from
-`pkg/kgateway/controller/controller.go` in `NewBaseGatewayController`.
+Add `pkg/kgateway/controller/gateway_parameters.go` and register it in
+`pkg/kgateway/controller/controller.go` via `NewBaseGatewayController`.
 
-Reconciler flow:
+Reconciler behavior:
 
-1. Watch `GatewayParameters` add/update/delete and reconcile by namespaced name.
-2. Fetch the latest object; return successfully when not found/deleted.
-3. Validate object-level correctness via shared deployer validation helper.
-4. Build desired `Accepted` condition:
-   - valid -> `status=True`, `reason=Accepted`
-   - invalid -> `status=False`, `reason=Invalid`, message includes error details
-5. Update `status.conditions` with retry-on-conflict logic and `observedGeneration`.
-6. Skip status writes when condition state is unchanged.
+1. Watch `GatewayParameters` events.
+2. Watch `Gateway` events and enqueue referenced `GatewayParameters` (direct references only).
+3. Watch `GatewayClass` events and enqueue referenced `GatewayParameters`.
+4. On reconcile, fetch current `GatewayParameters`.
+5. Build desired `status.parents` from indexed direct references:
+   - direct Gateway references
+   - direct GatewayClass references
+6. Sort and dedupe by parent key.
+7. Update status with retry-on-conflict, skipping no-op updates.
 
-### Deployer
+### Deployer and Gateway Controller Behavior
 
-Introduce a deployer-side validation helper for object-level checks in
-`pkg/kgateway/deployer/gateway_parameters_validation.go`.
+Reference-reporting status on `GatewayParameters` is independent from `Gateway` status semantics:
 
-Validation scope for this phase:
+- `pkg/kgateway/deployer/gateway_parameters.go` continues returning parameter-reference/configuration errors for invalid or missing references.
+- `pkg/kgateway/controller/gw_controller.go` continues setting
+  `Gateway Accepted=False Reason=InvalidParameters` for those failures, and restores `Accepted=True` when issues are resolved.
+- `pkg/reports/status.go` keeps the `InvalidParameters` guard to avoid status races with reporter-written accepted conditions.
 
-- branch/spec coherence (`kube` vs `selfManaged`)
-- deployer-relevant value resolvability checks
-- overlay applicability shape checks that can be evaluated without mutating cluster resources
+## Status Semantics
 
-### Translator and Proxy Syncer
+`GatewayParameters.status.parents[]` reports direct references only.
 
-No translator or proxy syncer behavior changes are required.
+Reference examples:
 
-### Reporting
+- `Gateway` parent:
+  - group: `gateway.networking.k8s.io`
+  - kind: `Gateway`
+  - namespace: `<gateway-namespace>`
+  - name: `<gateway-name>`
+- `GatewayClass` parent:
+  - group: `gateway.networking.k8s.io`
+  - kind: `GatewayClass`
+  - name: `<gatewayclass-name>`
 
-`GatewayParameters` status model:
+Condition shape per parent:
 
-- `status.conditions` uses Kubernetes `metav1.Condition`
-- primary condition type: `Accepted`
-- reason values:
-  - `Accepted`
-  - `Invalid`
-- message contains concise validation detail (single error verbatim; multiple errors summarized)
-- `observedGeneration` is set to the current object generation
+- type: `Referenced`
+- status: `True`
+- reason: `DirectReference`
+- observedGeneration: current `GatewayParameters` generation
 
-Status updates use standard condition helpers (`meta.SetStatusCondition`) and conflict retries.
+## Test Plan
 
-### Test Plan
+Unit/integration coverage:
 
-Unit tests:
-
-- reconciler sets `Accepted=True` for valid `GatewayParameters`
-- reconciler sets `Accepted=False`, `reason=Invalid`, and expected message for invalid specs
-- reconciler updates `observedGeneration` when spec generation changes
-- status update path remains idempotent and resilient to update conflicts
-
-Optional follow-up e2e:
-
-- verify accepted/invalid transitions for representative valid and invalid `GatewayParameters` examples
+- `pkg/kgateway/controller/controller_test.go`:
+  - verifies `GatewayParameters.status.parents` includes direct `Gateway` and `GatewayClass` references
+  - verifies parents are pruned after reference resources are deleted
+- `pkg/deployer/deployer_test.go`:
+  - preserves invalid/missing reference error expectations for Gateway deployment path
+- `test/e2e/features/deployer/suite.go`:
+  - preserves missing `GatewayParameters` flow where `Gateway` is initially `Accepted=False` and recovers to `Accepted=True`
 
 ## Alternatives
 
-- **Only update status during `Gateway` reconciliation**
-  - Rejected: can leave status stale or missing when no consumer reconcile occurs.
-- **Aggregate consumer outcomes into `GatewayParameters` status**
-  - Deferred: adds coupling and complexity; object validity is a clearer first increment.
-- **Introduce multiple detailed condition types in v1**
-  - Deferred: one primary `Accepted` condition is enough for immediate operator feedback.
+- Keep validation-first `GatewayParameters Accepted` status model.
+  - Rejected in this phase; it does not directly solve reference observability.
+- Add only a scalar summary count (for example, total references) without parent details.
+  - Rejected; a parent list is more actionable for operators.
 
-## Open Questions
-- Should we add a "Policy Attachment" condition? 
-  - would it be a summary of number of attached gateways / gatewayclasses or a detailed per-reference list?
-- Should a later phase add a summary of referencing resources (`Gateway`/`GatewayClass`) on status?
-- Is `Accepted|Invalid` sufficient long-term, or should reason taxonomy expand in a follow-up EP?
+## Follow-Ups
+
+- Optional summary fields (for example, reference counts by kind) on top of `parents`.
+- Optional filtering by controller ownership when mixed controllers coexist.
+- Optional expansion of parent condition taxonomy if we later need richer reference metadata.

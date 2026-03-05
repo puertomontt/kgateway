@@ -231,23 +231,118 @@ func (s *ControllerSuite) TestGatewayStatus() {
 	}
 }
 
-// TestInvalidGatewayParameters tests that a Gateway with invalid GatewayParameters attached
-func (s *ControllerSuite) TestInvalidGatewayParameters() {
+func (s *ControllerSuite) TestGatewayParametersStatusReferences() {
 	ctx := context.Background()
-	var gwp *kgateway.GatewayParameters
-	var gw *gwv1.Gateway
+	gwp := &kgateway.GatewayParameters{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "ref-gwp",
+			Namespace: defaultNamespace,
+		},
+		Spec: kgateway.GatewayParametersSpec{
+			SelfManaged: &kgateway.SelfManagedGateway{},
+		},
+	}
+	gwClass := &gwv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "ref-gwp-class",
+		},
+		Spec: gwv1.GatewayClassSpec{
+			ControllerName: gwv1.GatewayController(gatewayControllerName),
+			ParametersRef: &gwv1.ParametersReference{
+				Group:     gwv1.Group(kgateway.GroupName),
+				Kind:      gwv1.Kind("GatewayParameters"),
+				Name:      gwp.Name,
+				Namespace: ptr.To(gwv1.Namespace(gwp.Namespace)),
+			},
+		},
+	}
+	gw := &gwv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "ref-gwp-gateway",
+			Namespace: defaultNamespace,
+		},
+		Spec: gwv1.GatewaySpec{
+			GatewayClassName: gwv1.ObjectName(gatewayClassName),
+			Infrastructure: &gwv1.GatewayInfrastructure{
+				ParametersRef: &gwv1.LocalParametersReference{
+					Group: kgateway.GroupName,
+					Kind:  "GatewayParameters",
+					Name:  gwp.Name,
+				},
+			},
+			Listeners: []gwv1.Listener{{
+				Name:     "listener",
+				Protocol: "HTTP",
+				Port:     80,
+			}},
+		},
+	}
 
 	s.T().Cleanup(func() {
-		err := s.client.Delete(ctx, gwp)
-		s.NoError(err)
-		err = s.client.Delete(ctx, gw)
-		s.NoError(err)
+		_ = s.client.Delete(ctx, gw)
+		_ = s.client.Delete(ctx, gwClass)
+		_ = s.client.Delete(ctx, gwp)
 	})
 
-	gwp = &kgateway.GatewayParameters{
+	err := s.client.Create(ctx, gwp)
+	s.Require().NoError(err)
+	err = s.client.Create(ctx, gwClass)
+	s.Require().NoError(err)
+	err = s.client.Create(ctx, gw)
+	s.Require().NoError(err)
+
+	s.Require().EventuallyWithT(func(c *assert.CollectT) {
+		current := &kgateway.GatewayParameters{}
+		err := s.client.Get(ctx, types.NamespacedName{Name: gwp.Name, Namespace: gwp.Namespace}, current)
+		require.NoError(c, err, "error getting GatewayParameters")
+		require.Len(c, current.Status.Parents, 2)
+
+		var foundGatewayParent bool
+		var foundGatewayClassParent bool
+		for _, parent := range current.Status.Parents {
+			if parent.ParentRef.Name == gwv1.ObjectName(gw.Name) {
+				foundGatewayParent = true
+				require.NotNil(c, parent.ParentRef.Namespace)
+				require.Equal(c, gwv1.Namespace(gw.Namespace), *parent.ParentRef.Namespace)
+				condition := meta.FindStatusCondition(parent.Conditions, "Referenced")
+				require.NotNil(c, condition)
+				require.Equal(c, metav1.ConditionTrue, condition.Status)
+				require.Equal(c, "DirectReference", condition.Reason)
+				require.Equal(c, current.Generation, condition.ObservedGeneration)
+			}
+			if parent.ParentRef.Name == gwv1.ObjectName(gwClass.Name) {
+				foundGatewayClassParent = true
+				condition := meta.FindStatusCondition(parent.Conditions, "Referenced")
+				require.NotNil(c, condition)
+				require.Equal(c, metav1.ConditionTrue, condition.Status)
+				require.Equal(c, "DirectReference", condition.Reason)
+				require.Equal(c, current.Generation, condition.ObservedGeneration)
+			}
+		}
+		require.True(c, foundGatewayParent, "expected direct Gateway parent in status")
+		require.True(c, foundGatewayClassParent, "expected GatewayClass parent in status")
+	}, defaultPollTimeout, 500*time.Millisecond, "timed out waiting for GatewayParameters to report direct references")
+
+	err = s.client.Delete(ctx, gw)
+	s.Require().NoError(err)
+	err = s.client.Delete(ctx, gwClass)
+	s.Require().NoError(err)
+
+	s.Require().EventuallyWithT(func(c *assert.CollectT) {
+		current := &kgateway.GatewayParameters{}
+		err := s.client.Get(ctx, types.NamespacedName{Name: gwp.Name, Namespace: gwp.Namespace}, current)
+		require.NoError(c, err, "error getting GatewayParameters")
+		require.Empty(c, current.Status.Parents)
+	}, defaultPollTimeout, 500*time.Millisecond, "timed out waiting for GatewayParameters status to prune removed references")
+}
+
+// TestInvalidGatewayParameters tests that Gateway InvalidParameters status remains reported.
+func (s *ControllerSuite) TestInvalidGatewayParameters() {
+	ctx := context.Background()
+	gwp := &kgateway.GatewayParameters{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "invalid-gwp",
-			Namespace: "default",
+			Namespace: defaultNamespace,
 		},
 		Spec: kgateway.GatewayParametersSpec{
 			Kube: &kgateway.KubernetesProxyConfig{
@@ -257,11 +352,10 @@ func (s *ControllerSuite) TestInvalidGatewayParameters() {
 			},
 		},
 	}
-	gw = &gwv1.Gateway{
+	gw := &gwv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:       "gw",
-			Namespace:  "default",
-			Generation: 1,
+			Name:      "invalid-gwp-gateway",
+			Namespace: defaultNamespace,
 		},
 		Spec: gwv1.GatewaySpec{
 			GatewayClassName: gwv1.ObjectName(gatewayClassName),
@@ -279,21 +373,27 @@ func (s *ControllerSuite) TestInvalidGatewayParameters() {
 			}},
 		},
 	}
+
+	s.T().Cleanup(func() {
+		_ = s.client.Delete(ctx, gw)
+		_ = s.client.Delete(ctx, gwp)
+	})
+
 	err := s.client.Create(ctx, gwp)
 	s.Require().NoError(err)
 	err = s.client.Create(ctx, gw)
 	s.Require().NoError(err)
 
 	s.Require().EventuallyWithT(func(c *assert.CollectT) {
-		err := s.client.Get(ctx, types.NamespacedName{Name: gw.Name, Namespace: gw.Namespace}, gw)
+		current := &gwv1.Gateway{}
+		err := s.client.Get(ctx, types.NamespacedName{Name: gw.Name, Namespace: gw.Namespace}, current)
 		require.NoError(c, err, "error getting Gateway")
-
-		condition := meta.FindStatusCondition(gw.Status.Conditions, string(gwv1.GatewayConditionAccepted))
+		condition := meta.FindStatusCondition(current.Status.Conditions, string(gwv1.GatewayConditionAccepted))
 		require.NotNil(c, condition)
 		require.Equal(c, metav1.ConditionFalse, condition.Status)
 		require.Equal(c, string(gwv1.GatewayReasonInvalidParameters), condition.Reason)
-		require.Equal(c, gw.Generation, condition.ObservedGeneration)
-	}, defaultPollTimeout, 500*time.Millisecond, "timed out waiting for Gateway to have GatewayReasonInvalidParameters")
+		require.Equal(c, current.Generation, condition.ObservedGeneration)
+	}, defaultPollTimeout, 500*time.Millisecond, "timed out waiting for Gateway InvalidParameters status")
 }
 
 // TestGatewayClassStatus tests the Status conditions on GatewayClass

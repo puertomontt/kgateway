@@ -75,6 +75,10 @@ func NewBaseGatewayController(
 	if err := cfg.Mgr.Add(newGatewayClassReconciler(cfg, classInfos)); err != nil {
 		return err
 	}
+	// Initialize GatewayParameters status reconciler
+	if err := cfg.Mgr.Add(newGatewayParametersReconciler(cfg)); err != nil {
+		return err
+	}
 
 	return nil
 }

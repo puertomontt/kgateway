@@ -4,6 +4,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	"github.com/kgateway-dev/kgateway/v2/api/v1alpha1/shared"
 )
@@ -75,8 +76,12 @@ func (in *GatewayParametersSpec) GetSelfManaged() *SelfManagedGateway {
 	return in.SelfManaged
 }
 
-// The current conditions of the GatewayParameters. This is not currently implemented.
-type GatewayParametersStatus struct{}
+// The current status of the GatewayParameters.
+type GatewayParametersStatus struct {
+	// Parents describes resources that directly reference this GatewayParameters.
+	// +optional
+	Parents []gwv1.RouteParentStatus `json:"parents,omitempty"`
+}
 
 type SelfManagedGateway struct{}
 
