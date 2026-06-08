@@ -3,6 +3,7 @@ package envutils
 import (
 	"os"
 	"strconv"
+	"time"
 )
 
 // IsEnvTruthy returns true if a given environment variable has a truthy value
@@ -41,6 +42,18 @@ func GetOrDefault(key, fallback string, allowEmpty bool) string {
 	if value, ok := os.LookupEnv(key); ok {
 		if allowEmpty || len(value) > 0 {
 			return value
+		}
+	}
+	return fallback
+}
+
+// GetDurationOrDefault returns the duration parsed from the environment variable
+// for the given key, or fallback if the variable is unset or cannot be parsed as
+// a Go duration (e.g. "10ms", "1s").
+func GetDurationOrDefault(key string, fallback time.Duration) time.Duration {
+	if value, ok := os.LookupEnv(key); ok {
+		if d, err := time.ParseDuration(value); err == nil {
+			return d
 		}
 	}
 	return fallback

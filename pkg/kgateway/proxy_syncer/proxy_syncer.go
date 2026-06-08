@@ -12,6 +12,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"istio.io/istio/pkg/kube/controllers"
 	"istio.io/istio/pkg/kube/krt"
+	"istio.io/istio/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -26,7 +27,6 @@ import (
 	"github.com/kgateway-dev/kgateway/v2/pkg/kgateway/utils"
 	"github.com/kgateway-dev/kgateway/v2/pkg/kgateway/wellknown"
 	"github.com/kgateway-dev/kgateway/v2/pkg/kgateway/xds"
-	kmetrics "github.com/kgateway-dev/kgateway/v2/pkg/krtcollections/metrics"
 	"github.com/kgateway-dev/kgateway/v2/pkg/logging"
 	plug "github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk"
 	"github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/collections"
@@ -509,40 +509,33 @@ func (s *ProxySyncer) Start(ctx context.Context) error {
 		s.backendStatusReportQueue.Enqueue(o.Latest().reportMap)
 	})
 
+	// xDS pushes are debounced/coalesced to protect the control plane (and
+	// connected Envoys) from rapid bursts of KRT events: rather than pushing a
+	// new snapshot for every per-client collection event, we collapse events for
+	// the same resource within a short quiet period into a single push of the
+	// latest snapshot. See runXDSPushDebounce for the timing semantics.
+	//
+	// The batch handler only feeds resource names into the debounce channel; the
+	// actual push (and its readiness/"retain last good" handling) happens in
+	// syncXdsForResource, which re-fetches the latest snapshot at flush time.
+	// Notably, this means a KRT Delete (which snapshotPerClient also surfaces
+	// while it defers publishing for readiness) is handled by GetKey returning
+	// nil: we leave the xDS cache untouched so Envoy keeps serving its last
+	// coherent config rather than withdrawing valid routes.
+	pushCh := make(chan string, xdsPushChannelBufferSize)
+	go runXDSPushDebounce(ctx.Done(), pushCh, xdsDebounceAfter, xdsDebounceMax, func(resourceNames sets.Set[string]) {
+		for resourceName := range resourceNames {
+			s.syncXdsForResource(ctx, resourceName)
+		}
+	})
+
 	s.perclientSnapCollection.RegisterBatch(func(o []krt.Event[XdsSnapWrapper]) {
 		for _, e := range o {
-			cd := getDetailsFromXDSClientResourceName(e.Latest().ResourceName())
-
-			if e.Event != controllers.EventDelete {
-				snapWrap := e.Latest()
-				s.proxyTranslator.syncXds(ctx, snapWrap)
-			} else {
-				// Intentional no-op. When snapshotPerClient returns nil (its
-				// readiness guards deferred publishing), KRT surfaces a Delete
-				// for this UCC. Clearing the xDS cache here would withdraw
-				// Envoy's last coherent Snapshot for the duration of the defer,
-				// causing 500/NC on valid routes. Leaving the cache alone means
-				// Envoy keeps serving its previously-published config until a
-				// new coherent snapshot overwrites it — the "retain last good"
-				// behavior that prevents unresolvable cluster references from
-				// stranding live traffic.
-				//
-				// Known leak: this branch also fires when a UCC truly goes
-				// away (Envoy pod replaced on rollout, scaled down, etc.),
-				// and we cannot distinguish that from the "defer" case here.
-				// The SnapshotCache entry for that UCC is therefore never
-				// cleared and accumulates over the controller's lifetime.
-				// Pre-existing behavior (the prior ClearSnapshot call was
-				// already commented out); reclaiming these entries requires
-				// a separate signal — e.g. cross-referencing uccCol
-				// membership — and is left to a follow-up.
+			select {
+			case pushCh <- e.Latest().ResourceName():
+			case <-ctx.Done():
+				return
 			}
-
-			kmetrics.EndResourceXDSSync(kmetrics.ResourceSyncDetails{
-				Namespace:    cd.Namespace,
-				Gateway:      cd.Gateway,
-				ResourceName: cd.Gateway,
-			})
 		}
 	}, true)
 
