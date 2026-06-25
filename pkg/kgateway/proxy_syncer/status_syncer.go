@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/avast/retry-go/v4"
@@ -47,23 +48,30 @@ type StatusSyncer struct {
 	istioClient    apiclient.Client
 
 	latestReportQueue              utils.AsyncQueue[reports.ReportMap]
+	gatewayControllerReportQueue   utils.AsyncQueue[reports.ReportMap]
 	latestBackendPolicyReportQueue utils.AsyncQueue[reports.ReportMap]
 	latestBackendStatusReportQueue utils.AsyncQueue[reports.ReportMap]
 	cacheSyncs                     []cache.InformerSynced
 
 	customStatusSync func(ctx context.Context, rm reports.ReportMap)
+
+	gatewayStatusMu           sync.Mutex
+	latestGatewayStatusReport reports.ReportMap
+	hasGatewayStatusReport    bool
+	gatewayControllerReports  map[types.NamespacedName]*reports.GatewayReport
 }
 
 // StatusSyncerConfig holds the dependencies required to construct a StatusSyncer.
 type StatusSyncerConfig struct {
-	Mgr                      manager.Manager
-	Plugins                  plug.Plugin
-	ControllerName           string
-	Client                   apiclient.Client
-	ReportQueue              utils.AsyncQueue[reports.ReportMap]
-	BackendPolicyReportQueue utils.AsyncQueue[reports.ReportMap]
-	BackendStatusReportQueue utils.AsyncQueue[reports.ReportMap]
-	CacheSyncs               []cache.InformerSynced
+	Mgr                          manager.Manager
+	Plugins                      plug.Plugin
+	ControllerName               string
+	Client                       apiclient.Client
+	ReportQueue                  utils.AsyncQueue[reports.ReportMap]
+	GatewayControllerReportQueue utils.AsyncQueue[reports.ReportMap]
+	BackendPolicyReportQueue     utils.AsyncQueue[reports.ReportMap]
+	BackendStatusReportQueue     utils.AsyncQueue[reports.ReportMap]
+	CacheSyncs                   []cache.InformerSynced
 }
 
 func NewStatusSyncer(cfg StatusSyncerConfig, opts ...StatusSyncerOption) *StatusSyncer {
@@ -74,11 +82,95 @@ func NewStatusSyncer(cfg StatusSyncerConfig, opts ...StatusSyncerOption) *Status
 		istioClient:                    cfg.Client,
 		controllerName:                 cfg.ControllerName,
 		latestReportQueue:              cfg.ReportQueue,
+		gatewayControllerReportQueue:   cfg.GatewayControllerReportQueue,
 		latestBackendPolicyReportQueue: cfg.BackendPolicyReportQueue,
 		latestBackendStatusReportQueue: cfg.BackendStatusReportQueue,
 		cacheSyncs:                     cfg.CacheSyncs,
 		customStatusSync:               optCfg.CustomStatusSync,
+		gatewayControllerReports:       make(map[types.NamespacedName]*reports.GatewayReport),
 	}
+}
+
+func (s *StatusSyncer) gatewayStatusReportForTranslation(reportMap reports.ReportMap) reports.ReportMap {
+	s.gatewayStatusMu.Lock()
+	defer s.gatewayStatusMu.Unlock()
+
+	s.latestGatewayStatusReport = reportMap.CloneGatewayReports()
+	s.hasGatewayStatusReport = true
+	return s.mergeGatewayControllerReportsLocked(s.latestGatewayStatusReport)
+}
+
+func (s *StatusSyncer) gatewayStatusReportForControllerReport(reportMap reports.ReportMap) reports.ReportMap {
+	s.gatewayStatusMu.Lock()
+	defer s.gatewayStatusMu.Unlock()
+
+	s.applyGatewayControllerReportLocked(reportMap)
+	mergedReport := reports.NewReportMap()
+	for key, report := range reportMap.Gateways {
+		if s.hasGatewayStatusReport {
+			if latestReport := s.latestGatewayStatusReport.GatewayNamespaceName(key); latestReport != nil {
+				mergedReport.Gateways[key] = latestReport.Clone()
+			}
+		}
+		if _, exists := mergedReport.Gateways[key]; !exists {
+			mergedReport.Gateways[key] = report.Clone()
+		}
+		if controllerReport := s.gatewayControllerReports[key]; controllerReport != nil {
+			if mergedReport.Gateways[key] == nil {
+				mergedReport.Gateways[key] = controllerReport.Clone()
+				continue
+			}
+			mergeGatewayControllerReport(mergedReport.Gateways[key], controllerReport)
+		}
+	}
+	return mergedReport
+}
+
+func (s *StatusSyncer) applyGatewayControllerReportLocked(reportMap reports.ReportMap) {
+	if s.gatewayControllerReports == nil {
+		s.gatewayControllerReports = make(map[types.NamespacedName]*reports.GatewayReport)
+	}
+	for key, report := range reportMap.Gateways {
+		if !isInvalidParametersGatewayReport(report) {
+			delete(s.gatewayControllerReports, key)
+			continue
+		}
+		s.gatewayControllerReports[key] = report.Clone()
+	}
+}
+
+func (s *StatusSyncer) mergeGatewayControllerReportsLocked(reportMap reports.ReportMap) reports.ReportMap {
+	mergedReport := reportMap.CloneGatewayReports()
+	for key, controllerReport := range s.gatewayControllerReports {
+		if controllerReport == nil {
+			continue
+		}
+		gatewayReport := mergedReport.GatewayNamespaceName(key)
+		if gatewayReport == nil {
+			mergedReport.Gateways[key] = controllerReport.Clone()
+			continue
+		}
+		mergeGatewayControllerReport(gatewayReport, controllerReport)
+	}
+	return mergedReport
+}
+
+func mergeGatewayControllerReport(gatewayReport, controllerReport *reports.GatewayReport) {
+	for _, condition := range controllerReport.GetConditions() {
+		gatewayReport.SetCondition(reportssdk.GatewayCondition{
+			Type:    gwv1.GatewayConditionType(condition.Type),
+			Status:  condition.Status,
+			Reason:  gwv1.GatewayConditionReason(condition.Reason),
+			Message: condition.Message,
+		})
+	}
+}
+
+func isInvalidParametersGatewayReport(report *reports.GatewayReport) bool {
+	accepted := apimeta.FindStatusCondition(report.GetConditions(), string(gwv1.GatewayConditionAccepted))
+	return accepted != nil &&
+		accepted.Status == metav1.ConditionFalse &&
+		accepted.Reason == string(gwv1.GatewayReasonInvalidParameters)
 }
 
 func (s *StatusSyncer) Start(ctx context.Context) error {
@@ -115,7 +207,7 @@ func (s *StatusSyncer) Start(ctx context.Context) error {
 				logger.Error("failed to dequeue gateway reports", "error", err)
 				return
 			}
-			s.syncGatewayStatus(ctx, gatewayStatusLogger, latestReport)
+			s.syncGatewayStatus(ctx, gatewayStatusLogger, s.gatewayStatusReportForTranslation(latestReport))
 			s.syncListenerSetStatus(ctx, listenerSetStatusLogger, latestReport)
 			s.syncRouteStatus(ctx, routeStatusLogger, latestReport)
 			s.syncPolicyStatus(ctx, latestReport)
@@ -124,6 +216,18 @@ func (s *StatusSyncer) Start(ctx context.Context) error {
 			}
 		}
 	}()
+	if s.gatewayControllerReportQueue != nil {
+		go func() {
+			for {
+				latestReport, err := s.gatewayControllerReportQueue.Dequeue(ctx)
+				if err != nil {
+					logger.Error("failed to dequeue gateway controller reports", "error", err)
+					return
+				}
+				s.syncGatewayStatus(ctx, gatewayStatusLogger, s.gatewayStatusReportForControllerReport(latestReport))
+			}
+		}()
+	}
 	go func() {
 		for {
 			latestReport, err := s.latestBackendPolicyReportQueue.Dequeue(ctx)
@@ -507,14 +611,7 @@ func (s *StatusSyncer) syncGatewayStatus(ctx context.Context, logger *slog.Logge
 			logger.Info("updated gateway status", "gateway", gwnn.String())
 
 			for _, cond := range gw.Status.Conditions {
-				if cond.Type != string(gwv1.GatewayConditionAccepted) &&
-					cond.Type != string(gwv1.GatewayConditionProgrammed) {
-					continue
-				}
-
-				if cond.Reason != string(gwv1.GatewayReasonAccepted) &&
-					cond.Reason != string(gwv1.GatewayReasonProgrammed) &&
-					cond.Reason != string(gwv1.GatewayReasonPending) {
+				if !isKnownGatewayStatusReason(cond.Type, cond.Reason) {
 					logger.Debug("invalid status condition reason", "reason", cond.Reason, "gateway", gwnn.String())
 
 					statusErr = fmt.Errorf("invalid gateway condition")
@@ -541,6 +638,42 @@ func (s *StatusSyncer) syncGatewayStatus(ctx context.Context, logger *slog.Logge
 	}
 
 	logger.Debug("synced gw status for gateways", "count", len(rm.Gateways))
+}
+
+func isKnownGatewayStatusReason(conditionType, reason string) bool {
+	switch gwv1.GatewayConditionType(conditionType) {
+	case gwv1.GatewayConditionAccepted:
+		switch gwv1.GatewayConditionReason(reason) {
+		case gwv1.GatewayReasonAccepted,
+			gwv1.GatewayReasonPending,
+			gwv1.GatewayReasonListenersNotValid,
+			gwv1.GatewayReasonUnsupportedAddress,
+			gwv1.GatewayReasonInvalidParameters:
+			return true
+		}
+	case gwv1.GatewayConditionProgrammed:
+		switch gwv1.GatewayConditionReason(reason) {
+		case gwv1.GatewayReasonProgrammed,
+			gwv1.GatewayReasonPending,
+			gwv1.GatewayReasonAddressNotAssigned,
+			gwv1.GatewayReasonAddressNotUsable,
+			gwv1.GatewayReasonNoResources:
+			return true
+		}
+	case gwv1.GatewayConditionResolvedRefs:
+		switch gwv1.GatewayConditionReason(reason) {
+		case gwv1.GatewayReasonResolvedRefs,
+			gwv1.GatewayReasonInvalidClientCertificateRef,
+			gwv1.GatewayReasonRefNotPermitted,
+			gwv1.GatewayReasonListenersNotResolved:
+			return true
+		}
+	case gwv1.GatewayConditionInsecureFrontendValidationMode:
+		return reason == string(gwv1.GatewayReasonConfigurationChanged)
+	default:
+		return true
+	}
+	return false
 }
 
 // syncListenerSetStatus will build and update status for all Listener Sets in a reportMap

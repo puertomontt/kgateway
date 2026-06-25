@@ -167,14 +167,15 @@ func NewControllerBuilder(ctx context.Context, cfg StartConfig) (*ControllerBuil
 		}
 
 		statusSyncer := proxy_syncer.NewStatusSyncer(proxy_syncer.StatusSyncerConfig{
-			Mgr:                      cfg.Manager,
-			Plugins:                  mergedPlugins,
-			ControllerName:           cfg.ControllerName,
-			Client:                   cfg.Client,
-			ReportQueue:              proxySyncer.ReportQueue(),
-			BackendPolicyReportQueue: proxySyncer.BackendPolicyReportQueue(),
-			BackendStatusReportQueue: proxySyncer.BackendStatusReportQueue(),
-			CacheSyncs:               proxySyncer.CacheSyncs(),
+			Mgr:                          cfg.Manager,
+			Plugins:                      mergedPlugins,
+			ControllerName:               cfg.ControllerName,
+			Client:                       cfg.Client,
+			ReportQueue:                  proxySyncer.ReportQueue(),
+			GatewayControllerReportQueue: proxySyncer.GatewayControllerReportQueue(),
+			BackendPolicyReportQueue:     proxySyncer.BackendPolicyReportQueue(),
+			BackendStatusReportQueue:     proxySyncer.BackendStatusReportQueue(),
+			CacheSyncs:                   proxySyncer.CacheSyncs(),
 		}, cfg.StatusSyncerOptions...)
 		if err := cfg.Manager.Add(statusSyncer); err != nil {
 			setupLog.Error(err, "unable to add statusSyncer runnable")
@@ -271,6 +272,9 @@ func (c *ControllerBuilder) Build(ctx context.Context) error {
 		GatewayClassName:         c.cfg.GatewayClassName,
 		WaypointGatewayClassName: c.cfg.WaypointGatewayClassName,
 		CertWatcher:              c.cfg.SetupOpts.CertWatcher,
+	}
+	if c.proxySyncer != nil {
+		gwCfg.GatewayControllerReportQueue = c.proxySyncer.GatewayControllerReportQueue()
 	}
 
 	setupLog.Info("creating base gateway controller")

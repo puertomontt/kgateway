@@ -33,10 +33,12 @@ import (
 	"github.com/kgateway-dev/kgateway/v2/api/v1alpha1/kgateway"
 	"github.com/kgateway-dev/kgateway/v2/pkg/deployer"
 	internaldeployer "github.com/kgateway-dev/kgateway/v2/pkg/kgateway/deployer"
+	"github.com/kgateway-dev/kgateway/v2/pkg/kgateway/utils"
 	"github.com/kgateway-dev/kgateway/v2/pkg/kgateway/wellknown"
 	"github.com/kgateway-dev/kgateway/v2/pkg/logging"
 	"github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk"
 	"github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/ir"
+	reportssdk "github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/reporter"
 	"github.com/kgateway-dev/kgateway/v2/pkg/reports"
 	"github.com/kgateway-dev/kgateway/v2/pkg/utils/kubeutils"
 )
@@ -66,7 +68,8 @@ type gatewayReconciler struct {
 	svcAccountClient kclient.Client[*corev1.ServiceAccount]
 	configMapClient  kclient.Client[*corev1.ConfigMap]
 
-	controllerExtension pluginsdk.GatewayControllerExtension
+	controllerExtension      pluginsdk.GatewayControllerExtension
+	gatewayStatusReportQueue utils.AsyncQueue[reports.ReportMap]
 
 	queue controllers.Queue
 }
@@ -79,12 +82,13 @@ func NewGatewayReconciler(
 ) *gatewayReconciler {
 	filter := kclient.Filter{ObjectFilter: cfg.Client.ObjectFilter()}
 	r := &gatewayReconciler{
-		deployer:            deployer,
-		gwParams:            gwParams,
-		scheme:              cfg.Mgr.GetScheme(),
-		controllerName:      cfg.ControllerName,
-		enableEnvoy:         cfg.CommonCollections.Settings.EnableEnvoy,
-		controllerExtension: controllerExtension,
+		deployer:                 deployer,
+		gwParams:                 gwParams,
+		scheme:                   cfg.Mgr.GetScheme(),
+		controllerName:           cfg.ControllerName,
+		enableEnvoy:              cfg.CommonCollections.Settings.EnableEnvoy,
+		controllerExtension:      controllerExtension,
+		gatewayStatusReportQueue: cfg.GatewayControllerReportQueue,
 
 		gwClient:         kclient.NewFilteredDelayed[*gwv1.Gateway](cfg.Client, gvr.KubernetesGateway, filter),
 		gwClassClient:    kclient.NewFilteredDelayed[*gwv1.GatewayClass](cfg.Client, gvr.GatewayClass, filter),
@@ -315,30 +319,13 @@ func (r *gatewayReconciler) Reconcile(req types.NamespacedName) (rErr error) {
 		// if we fail to either reference a valid GatewayParameters or
 		// the GatewayParameters configuration leads to issues building the
 		// objects, we want to set the status to InvalidParameters.
-		condition := metav1.Condition{
-			Type:               string(gwv1.GatewayConditionAccepted),
-			Status:             metav1.ConditionFalse,
-			ObservedGeneration: gw.Generation,
-			Reason:             string(gwv1.GatewayReasonInvalidParameters),
-			Message:            err.Error(),
-		}
-		if statusErr := r.updateGatewayStatusWithRetry(ctx, gw, condition); statusErr != nil {
-			return fmt.Errorf("failed to update status for Gateway %s: %w", req, statusErr)
+		if statusErr := r.reportInvalidGatewayParameters(ctx, gw, err); statusErr != nil {
+			return fmt.Errorf("failed to report status for Gateway %s: %w", req, statusErr)
 		}
 		return err
-	} else if existing := meta.FindStatusCondition(gw.Status.Conditions, string(gwv1.GatewayConditionAccepted)); existing != nil &&
-		existing.Status == metav1.ConditionFalse &&
-		existing.Reason == string(gwv1.GatewayReasonInvalidParameters) {
-		// set the status Accepted=true if it had been set to false due to InvalidParameters
-		condition := metav1.Condition{
-			Type:               string(gwv1.GatewayConditionAccepted),
-			Status:             metav1.ConditionTrue,
-			ObservedGeneration: gw.Generation,
-			Reason:             string(gwv1.GatewayReasonAccepted),
-			Message:            reports.GatewayAcceptedMessage,
-		}
-		if statusErr := r.updateGatewayStatusWithRetry(ctx, gw, condition); statusErr != nil {
-			return fmt.Errorf("failed to update status for Gateway %s: %w", req, statusErr)
+	} else {
+		if statusErr := r.clearInvalidGatewayParameters(ctx, gw); statusErr != nil {
+			return fmt.Errorf("failed to report status for Gateway %s: %w", req, statusErr)
 		}
 	}
 	objs = r.deployer.SetNamespaceAndOwnerWithGVK(gw, wellknown.GatewayGVK, objs)
@@ -398,6 +385,51 @@ func (r *gatewayReconciler) updateStatus(ctx context.Context, gw *gwv1.Gateway, 
 	// update gateway addresses in the status
 	desiredAddresses := getDesiredAddresses(gw, svc)
 	return updateGatewayAddresses(ctx, r.gwClient, client.ObjectKeyFromObject(gw), desiredAddresses)
+}
+
+func (r *gatewayReconciler) reportInvalidGatewayParameters(ctx context.Context, gw *gwv1.Gateway, err error) error {
+	return r.reportGatewayStatusCondition(ctx, gw, metav1.Condition{
+		Type:               string(gwv1.GatewayConditionAccepted),
+		Status:             metav1.ConditionFalse,
+		ObservedGeneration: gw.Generation,
+		Reason:             string(gwv1.GatewayReasonInvalidParameters),
+		Message:            err.Error(),
+	})
+}
+
+func (r *gatewayReconciler) clearInvalidGatewayParameters(ctx context.Context, gw *gwv1.Gateway) error {
+	if r.gatewayStatusReportQueue == nil {
+		existing := meta.FindStatusCondition(gw.Status.Conditions, string(gwv1.GatewayConditionAccepted))
+		if existing == nil ||
+			existing.Status != metav1.ConditionFalse ||
+			existing.Reason != string(gwv1.GatewayReasonInvalidParameters) {
+			return nil
+		}
+	}
+
+	return r.reportGatewayStatusCondition(ctx, gw, metav1.Condition{
+		Type:               string(gwv1.GatewayConditionAccepted),
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: gw.Generation,
+		Reason:             string(gwv1.GatewayReasonAccepted),
+		Message:            reports.GatewayAcceptedMessage,
+	})
+}
+
+func (r *gatewayReconciler) reportGatewayStatusCondition(ctx context.Context, gw *gwv1.Gateway, condition metav1.Condition) error {
+	if r.gatewayStatusReportQueue == nil {
+		return r.updateGatewayStatusWithRetry(ctx, gw, condition)
+	}
+
+	rm := reports.NewReportMap()
+	reports.NewReporter(&rm).Gateway(gw).SetCondition(reportssdk.GatewayCondition{
+		Type:    gwv1.GatewayConditionType(condition.Type),
+		Status:  condition.Status,
+		Reason:  gwv1.GatewayConditionReason(condition.Reason),
+		Message: condition.Message,
+	})
+	r.gatewayStatusReportQueue.Enqueue(rm)
+	return nil
 }
 
 func getDesiredAddresses(gw *gwv1.Gateway, svc *corev1.Service) []gwv1.GatewayStatusAddress {

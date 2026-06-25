@@ -88,6 +88,45 @@ func NewReportMap() ReportMap {
 	}
 }
 
+func (r ReportMap) CloneGatewayReports() ReportMap {
+	out := NewReportMap()
+	for key, report := range r.Gateways {
+		out.Gateways[key] = report.Clone()
+	}
+	return out
+}
+
+func (g *GatewayReport) Clone() *GatewayReport {
+	if g == nil {
+		return nil
+	}
+	out := &GatewayReport{
+		conditions:           slices.Clone(g.conditions),
+		observedGeneration:   g.observedGeneration,
+		attachedListenerSets: g.attachedListenerSets,
+	}
+	if g.listeners != nil {
+		out.listeners = make(map[string]*ListenerReport, len(g.listeners))
+		for name, listener := range g.listeners {
+			if listener == nil {
+				out.listeners[name] = nil
+				continue
+			}
+			out.listeners[name] = &ListenerReport{
+				Status: cloneListenerStatus(listener.Status),
+			}
+		}
+	}
+	return out
+}
+
+func cloneListenerStatus(status gwv1.ListenerStatus) gwv1.ListenerStatus {
+	out := status
+	out.Conditions = slices.Clone(status.Conditions)
+	out.SupportedKinds = slices.Clone(status.SupportedKinds)
+	return out
+}
+
 func key(obj metav1.Object) types.NamespacedName {
 	return types.NamespacedName{Namespace: obj.GetNamespace(), Name: obj.GetName()}
 }
@@ -281,6 +320,13 @@ func (g *GatewayReport) GetConditions() []metav1.Condition {
 		return []metav1.Condition{}
 	}
 	return g.conditions
+}
+
+func (g *GatewayReport) GetObservedGeneration() int64 {
+	if g == nil {
+		return 0
+	}
+	return g.observedGeneration
 }
 
 func (g *GatewayReport) SetCondition(gc reporter.GatewayCondition) {

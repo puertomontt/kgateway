@@ -105,7 +105,7 @@ func (r *ReportMap) BuildGWStatus(ctx context.Context, gw gwv1.Gateway, attached
 
 	gwConditions = handleInvalidAddresses(gwConditions, &gw)
 	gwConditions = handleInsecureFrontendValidationMode(gwConditions, &gw)
-	gwConditions = gatewayConditionsWithDefaults(gwConditions, &gw, finalListeners)
+	gwConditions = gatewayConditionsWithDefaults(gwConditions, finalListeners)
 
 	finalConditions := make([]metav1.Condition, 0)
 	for _, gwCondition := range gwConditions {
@@ -248,12 +248,6 @@ func isReporterOwnedGatewayConditionType(conditionType gwv1.GatewayConditionType
 func shouldPreserveGatewayCondition(condition metav1.Condition, finalConditions []metav1.Condition) bool {
 	if meta.FindStatusCondition(finalConditions, condition.Type) != nil {
 		return false
-	}
-
-	if condition.Type == string(gwv1.GatewayConditionAccepted) &&
-		condition.Status == metav1.ConditionFalse &&
-		condition.Reason == string(gwv1.GatewayReasonInvalidParameters) {
-		return true
 	}
 
 	return !isReporterOwnedGatewayConditionType(gwv1.GatewayConditionType(condition.Type))
@@ -586,15 +580,9 @@ func ParentString(ref gwv1.ParentReference) string {
 		ptr.OrEmpty(ref.Namespace))
 }
 
-func gatewayConditionsWithDefaults(conditions []metav1.Condition, gw *gwv1.Gateway, listeners []gwv1.ListenerStatus) []metav1.Condition {
+func gatewayConditionsWithDefaults(conditions []metav1.Condition, listeners []gwv1.ListenerStatus) []metav1.Condition {
 	out := slices.Clone(conditions)
-	// If the existing Gateway status contains an Accepted=False with Reason=InvalidParameters,
-	// we don't want to override it with a true Accepted status. The controller will set Accepted=True
-	// when the GatewayParameters are valid again. Otherwise there is a race condition between the controller and reporter.
-	// HACK: This is because both the controller and reporter set Accepted status.
-	existingAccepted := meta.FindStatusCondition(gw.Status.Conditions, string(gwv1.GatewayConditionAccepted))
-	hasInvalidParams := existingAccepted != nil && existingAccepted.Status == metav1.ConditionFalse && existingAccepted.Reason == string(gwv1.GatewayReasonInvalidParameters)
-	if !hasInvalidParams && meta.FindStatusCondition(out, string(gwv1.GatewayConditionAccepted)) == nil {
+	if meta.FindStatusCondition(out, string(gwv1.GatewayConditionAccepted)) == nil {
 		meta.SetStatusCondition(&out, metav1.Condition{
 			Type:    string(gwv1.GatewayConditionAccepted),
 			Status:  metav1.ConditionTrue,

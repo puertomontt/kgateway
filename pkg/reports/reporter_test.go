@@ -147,7 +147,7 @@ var _ = Describe("Reporting Infrastructure", func() {
 			Expect(meta.FindStatusCondition(status.Conditions, string(gwv1.GatewayConditionInsecureFrontendValidationMode))).To(BeNil())
 		})
 
-		It("should preserve controller-managed invalid parameters accepted conditions", func() {
+		It("should not preserve stale reporter-owned invalid parameters accepted conditions", func() {
 			gw := gw()
 			gw.Status.Conditions = append(gw.Status.Conditions, metav1.Condition{
 				Type:   string(gwv1.GatewayConditionAccepted),
@@ -164,8 +164,8 @@ var _ = Describe("Reporting Infrastructure", func() {
 			Expect(status).NotTo(BeNil())
 			condition := meta.FindStatusCondition(status.Conditions, string(gwv1.GatewayConditionAccepted))
 			Expect(condition).NotTo(BeNil())
-			Expect(condition.Status).To(Equal(metav1.ConditionFalse))
-			Expect(condition.Reason).To(Equal(string(gwv1.GatewayReasonInvalidParameters)))
+			Expect(condition.Status).To(Equal(metav1.ConditionTrue))
+			Expect(condition.Reason).To(Equal(string(gwv1.GatewayReasonAccepted)))
 		})
 
 		It("should correctly set negative gateway conditions from report and not add extra conditions", func() {

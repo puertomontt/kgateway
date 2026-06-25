@@ -64,9 +64,10 @@ type ProxySyncer struct {
 	waitForSync []cache.InformerSynced
 	ready       atomic.Bool
 
-	reportQueue              utils.AsyncQueue[reports.ReportMap]
-	backendPolicyReportQueue utils.AsyncQueue[reports.ReportMap]
-	backendStatusReportQueue utils.AsyncQueue[reports.ReportMap]
+	reportQueue                  utils.AsyncQueue[reports.ReportMap]
+	gatewayControllerReportQueue utils.AsyncQueue[reports.ReportMap]
+	backendPolicyReportQueue     utils.AsyncQueue[reports.ReportMap]
+	backendStatusReportQueue     utils.AsyncQueue[reports.ReportMap]
 }
 
 type GatewayXdsResources struct {
@@ -160,17 +161,18 @@ func NewProxySyncer(
 	validator validator.Validator,
 ) *ProxySyncer {
 	return &ProxySyncer{
-		controllerName:           controllerName,
-		commonCols:               commonCols,
-		mgr:                      mgr,
-		apiClient:                client,
-		proxyTranslator:          NewProxyTranslator(xdsCache),
-		uniqueClients:            uniqueClients,
-		translator:               translator.NewCombinedTranslator(ctx, mergedPlugins, commonCols, validator),
-		plugins:                  mergedPlugins,
-		reportQueue:              utils.NewAsyncQueue[reports.ReportMap](),
-		backendPolicyReportQueue: utils.NewAsyncQueue[reports.ReportMap](),
-		backendStatusReportQueue: utils.NewAsyncQueue[reports.ReportMap](),
+		controllerName:               controllerName,
+		commonCols:                   commonCols,
+		mgr:                          mgr,
+		apiClient:                    client,
+		proxyTranslator:              NewProxyTranslator(xdsCache),
+		uniqueClients:                uniqueClients,
+		translator:                   translator.NewCombinedTranslator(ctx, mergedPlugins, commonCols, validator),
+		plugins:                      mergedPlugins,
+		reportQueue:                  utils.NewAsyncQueue[reports.ReportMap](),
+		gatewayControllerReportQueue: utils.NewAsyncQueue[reports.ReportMap](),
+		backendPolicyReportQueue:     utils.NewAsyncQueue[reports.ReportMap](),
+		backendStatusReportQueue:     utils.NewAsyncQueue[reports.ReportMap](),
 	}
 }
 
@@ -452,6 +454,12 @@ func (r *ProxySyncer) NeedLeaderElection() bool {
 // It will be constantly updated to contain the merged status report for Kube Gateway status.
 func (s *ProxySyncer) ReportQueue() utils.AsyncQueue[reports.ReportMap] {
 	return s.reportQueue
+}
+
+// GatewayControllerReportQueue returns the queue that contains Gateway status reports
+// produced outside translation, such as deployer/controller validation results.
+func (s *ProxySyncer) GatewayControllerReportQueue() utils.AsyncQueue[reports.ReportMap] {
+	return s.gatewayControllerReportQueue
 }
 
 // BackendPolicyReportQueue returns the queue that contains the latest status reports for all backend policies.

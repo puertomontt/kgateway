@@ -23,9 +23,9 @@ func TestBuildPolicyStatusPrefersPluginBuilder(t *testing.T) {
 		Name:      "tls-policy",
 	}
 	ancestorRef := gwv1.ParentReference{
-		Group:     ptrTo(gwv1.Group(gwv1.GroupVersion.Group)),
-		Kind:      ptrTo(gwv1.Kind("Gateway")),
-		Namespace: ptrTo(gwv1.Namespace("default")),
+		Group:     new(gwv1.Group(gwv1.GroupVersion.Group)),
+		Kind:      new(gwv1.Kind("Gateway")),
+		Namespace: new(gwv1.Namespace("default")),
 		Name:      gwv1.ObjectName("gw"),
 	}
 
@@ -71,9 +71,4 @@ func TestBuildPolicyStatusPrefersPluginBuilder(t *testing.T) {
 			"plugin-specific policy status selection should not mutate the report map",
 		)
 	}
-}
-
-//go:fix inline
-func ptrTo[T any](v T) *T {
-	return new(v)
 }
