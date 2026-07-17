@@ -47,16 +47,24 @@ func (s *ProxySyncer) initStatusInfra(ctx context.Context, krtopts krtutil.KrtOp
 	gatewayReports := s.statusReport.AsCollection()
 	backendReports := s.backendStatusReport.AsCollection()
 
+	// Per-resource report fragments: each gateway translation only recomputes its own
+	// fragments, and krt equality confines downstream recomputation to the resources
+	// whose reports actually changed (instead of fanning out from the merged singleton).
+	routeFragments, routeFragmentIndex := newRouteReportFragments(s.mostXdsSnapshots, krtopts)
+	gatewayFragments := newGatewayReportFragments(s.mostXdsSnapshots, krtopts)
+
 	// Gateway
 	gatewayStatuses := krt.NewCollection(s.commonCols.RawGateways, func(kctx krt.HandlerContext, gw *gwv1.Gateway) *krt.ObjectWithStatus[*gwv1.Gateway, gwv1.GatewayStatus] {
-		rw := krt.FetchOne(kctx, gatewayReports)
-		if rw == nil {
+		nn := types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}
+		fragment := krt.FetchOne(kctx, gatewayFragments, krt.FilterKey(nn.String()))
+		if fragment == nil {
+			// Not translated by us (e.g. another controller's Gateway).
 			return nil
 		}
-		rm := rw.Reports()
+		rm := reports.NewReportMap()
+		rm.Gateways[nn] = fragment.Report
 		status := rm.BuildGWStatus(ctx, *gw, nil)
 		if status == nil {
-			// Not in the report: not translated by us (e.g. another controller's Gateway).
 			return nil
 		}
 		// Addresses are written by the deployer, not by translation; carry the live value
@@ -84,14 +92,10 @@ func (s *ProxySyncer) initStatusInfra(ctx context.Context, krtopts krtutil.KrtOp
 
 	// Routes. Desired statuses carry the full RouteStatus (including preserved entries from
 	// other controllers, merged again at write time from the freshest informer state).
-	registerRouteStatus(s, ctx, krtopts, wellknown.HTTPRouteGVK, s.commonCols.RawHTTPRoutes,
-		func(rm reports.ReportMap, nn types.NamespacedName) bool { return rm.HTTPRoutes[nn] != nil })
-	registerRouteStatus(s, ctx, krtopts, wellknown.GRPCRouteGVK, s.commonCols.RawGRPCRoutes,
-		func(rm reports.ReportMap, nn types.NamespacedName) bool { return rm.GRPCRoutes[nn] != nil })
-	registerRouteStatus(s, ctx, krtopts, wellknown.TCPRouteGVK, s.commonCols.RawTCPRoutes,
-		func(rm reports.ReportMap, nn types.NamespacedName) bool { return rm.TCPRoutes[nn] != nil })
-	registerRouteStatus(s, ctx, krtopts, wellknown.TLSRouteGVK, s.commonCols.RawTLSRoutes,
-		func(rm reports.ReportMap, nn types.NamespacedName) bool { return rm.TLSRoutes[nn] != nil })
+	registerRouteStatus(s, ctx, krtopts, wellknown.HTTPRouteGVK, s.commonCols.RawHTTPRoutes, routeFragments, routeFragmentIndex)
+	registerRouteStatus(s, ctx, krtopts, wellknown.GRPCRouteGVK, s.commonCols.RawGRPCRoutes, routeFragments, routeFragmentIndex)
+	registerRouteStatus(s, ctx, krtopts, wellknown.TCPRouteGVK, s.commonCols.RawTCPRoutes, routeFragments, routeFragmentIndex)
+	registerRouteStatus(s, ctx, krtopts, wellknown.TLSRouteGVK, s.commonCols.RawTLSRoutes, routeFragments, routeFragmentIndex)
 
 	s.statusWriters[wellknown.HTTPRouteGVK] = routeWriter[*gwv1.HTTPRoute](cl, f, "httpRoute", wellknown.HTTPRouteGVR, wellknown.HTTPRouteKind, controllerName,
 		func(om metav1.ObjectMeta, st gwv1.RouteStatus) *gwv1.HTTPRoute {
@@ -235,6 +239,8 @@ func (s *ProxySyncer) initStatusInfra(ctx context.Context, krtopts krtutil.KrtOp
 	}
 
 	s.waitForSync = append(s.waitForSync,
+		routeFragments.HasSynced,
+		gatewayFragments.HasSynced,
 		gatewayStatuses.HasSynced,
 		listenerSetStatuses.HasSynced,
 		backendStatuses.HasSynced,
@@ -242,29 +248,39 @@ func (s *ProxySyncer) initStatusInfra(ctx context.Context, krtopts krtutil.KrtOp
 }
 
 // registerRouteStatus creates a derived desired-status collection for one route kind and
-// registers it with the status collections.
+// registers it with the status collections. A route's desired status is built from its
+// own report fragments (one per gateway that translated it), so only routes whose
+// fragments changed recompute.
 func registerRouteStatus[T controllers.ComparableObject](
 	s *ProxySyncer,
 	ctx context.Context,
 	krtopts krtutil.KrtOptions,
 	gvk schema.GroupVersionKind,
 	col krt.Collection[T],
-	hasReport func(rm reports.ReportMap, nn types.NamespacedName) bool,
+	fragments krt.Collection[routeReportFragment],
+	fragmentIndex krt.Index[routeFragmentKey, routeReportFragment],
 ) {
-	gatewayReports := s.statusReport.AsCollection()
 	controllerName := s.controllerName
 	statuses := krt.NewCollection(col, func(kctx krt.HandlerContext, route T) *krt.ObjectWithStatus[T, gwv1.RouteStatus] {
-		rw := krt.FetchOne(kctx, gatewayReports)
-		if rw == nil {
-			return nil
-		}
-		rm := rw.Reports()
 		nn := types.NamespacedName{Namespace: route.GetNamespace(), Name: route.GetName()}
-		// Skip routes with no report entry (e.g. routes owned by another controller) to
-		// avoid building (and logging about) statuses we will never write.
-		if !hasReport(rm, nn) {
+		routeFrags := krt.Fetch(kctx, fragments, krt.FilterIndex(fragmentIndex, routeFragmentKey{Kind: gvk.Kind, Route: nn}))
+
+		rm := reports.NewReportMap()
+		switch {
+		case len(routeFrags) > 0:
+			setRouteReport(&rm, gvk.Kind, nn, mergeRouteFragments(routeFrags))
+		case hasRouteParentsFor(routeStatusOf(route), controllerName):
+			// No fragments, but the live status still carries entries we own: the route is
+			// no longer translated (orphaned), so build from an empty report to clear our
+			// stale entries while preserving other controllers'. This replaces the status
+			// marker mechanism for routes with an exact live-state check.
+			_ = reports.NewReporter(&rm).Route(route)
+		default:
+			// Not translated by us and nothing of ours to clear (e.g. another controller's
+			// route): nothing to write.
 			return nil
 		}
+
 		status := rm.BuildRouteStatus(ctx, route, controllerName)
 		if status == nil {
 			return nil
@@ -279,6 +295,31 @@ func registerRouteStatus[T controllers.ComparableObject](
 		return routeStatusOf(o)
 	})
 	s.waitForSync = append(s.waitForSync, statuses.HasSynced)
+}
+
+// setRouteReport installs a route report into the report map under the right kind.
+func setRouteReport(rm *reports.ReportMap, kind string, nn types.NamespacedName, rr *reports.RouteReport) {
+	switch kind {
+	case wellknown.HTTPRouteKind:
+		rm.HTTPRoutes[nn] = rr
+	case wellknown.GRPCRouteKind:
+		rm.GRPCRoutes[nn] = rr
+	case wellknown.TCPRouteKind:
+		rm.TCPRoutes[nn] = rr
+	case wellknown.TLSRouteKind:
+		rm.TLSRoutes[nn] = rr
+	}
+}
+
+// hasRouteParentsFor reports whether the route status contains parent entries owned by
+// the given controller.
+func hasRouteParentsFor(status gwv1.RouteStatus, controllerName string) bool {
+	for _, p := range status.Parents {
+		if string(p.ControllerName) == controllerName {
+			return true
+		}
+	}
+	return false
 }
 
 // routeStatusOf extracts the common RouteStatus from any supported route type.
