@@ -134,6 +134,47 @@ func TestProcessRouteStatusMarkers(t *testing.T) {
 	})
 }
 
+func TestHasRouteStatusMarker(t *testing.T) {
+	controllerName := gwv1.GatewayController(wellknown.DefaultGatewayControllerName)
+	parentStatus := []gwv1.RouteParentStatus{{
+		ControllerName: controllerName,
+		ParentRef:      gwv1.ParentReference{Name: "gateway"},
+	}}
+	routeKey := types.NamespacedName{Namespace: "default", Name: "marked-route"}
+	routes := preRouteIndex(t, []any{
+		&gwv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: routeKey.Name, Namespace: routeKey.Namespace},
+			Status:     gwv1.HTTPRouteStatus{RouteStatus: gwv1.RouteStatus{Parents: parentStatus}},
+		},
+		&gwv1.GRPCRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: routeKey.Name, Namespace: routeKey.Namespace},
+			Status:     gwv1.GRPCRouteStatus{RouteStatus: gwv1.RouteStatus{Parents: parentStatus}},
+		},
+		&gwv1a2.TCPRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: routeKey.Name, Namespace: routeKey.Namespace},
+			Status:     gwv1a2.TCPRouteStatus{RouteStatus: gwv1.RouteStatus{Parents: parentStatus}},
+		},
+		&gwv1a2.TLSRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: routeKey.Name, Namespace: routeKey.Namespace},
+			Status:     gwv1a2.TLSRouteStatus{RouteStatus: gwv1.RouteStatus{Parents: parentStatus}},
+		},
+	})
+
+	for _, gvk := range []schema.GroupVersionKind{
+		wellknown.HTTPRouteGVK,
+		wellknown.GRPCRouteGVK,
+		wellknown.TCPRouteGVK,
+		wellknown.TLSRouteGVK,
+	} {
+		assert.True(t, routes.HasRouteStatusMarker(krt.TestingDummyContext{}, gvk, routeKey), gvk.String())
+	}
+	assert.False(t, routes.HasRouteStatusMarker(
+		krt.TestingDummyContext{},
+		wellknown.HTTPRouteGVK,
+		types.NamespacedName{Namespace: routeKey.Namespace, Name: "unmarked-route"},
+	))
+}
+
 func TestProcessRouteStatusMarkersPreservesExistingReports(t *testing.T) {
 	controllerName := gwv1.GatewayController(wellknown.DefaultGatewayControllerName)
 	parentStatus := []gwv1.RouteParentStatus{{

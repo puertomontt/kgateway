@@ -1135,6 +1135,29 @@ func (r *RoutesIndex) ProcessRouteStatusMarkers(kctx krt.HandlerContext, reportM
 	processRouteStatusMarkers(kctx, r.grpcRouteStatusMarkers, reportMap.GRPCRoutes, rp)
 }
 
+// HasRouteStatusMarker reports whether the route currently has status owned by
+// this controller. The keyed fetch makes this safe to use from a per-route KRT
+// transform: a status-only change invalidates only that route rather than every
+// route status in the collection.
+func (r *RoutesIndex) HasRouteStatusMarker(
+	kctx krt.HandlerContext,
+	gvk schema.GroupVersionKind,
+	nn types.NamespacedName,
+) bool {
+	switch gvk.Kind {
+	case wellknown.HTTPRouteKind:
+		return krt.FetchOne(kctx, r.httpRouteStatusMarkers, krt.FilterObjectName(nn)) != nil
+	case wellknown.GRPCRouteKind:
+		return krt.FetchOne(kctx, r.grpcRouteStatusMarkers, krt.FilterObjectName(nn)) != nil
+	case wellknown.TCPRouteKind:
+		return krt.FetchOne(kctx, r.tcpRouteStatusMarkers, krt.FilterObjectName(nn)) != nil
+	case wellknown.TLSRouteKind:
+		return krt.FetchOne(kctx, r.tlsRouteStatusMarkers, krt.FilterObjectName(nn)) != nil
+	default:
+		return false
+	}
+}
+
 // processRouteStatusMarkers fetches the route status markers and adds empty status for routes not
 // in the report map to clear stale status.
 func processRouteStatusMarkers[T controllers.Object](

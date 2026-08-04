@@ -32,10 +32,10 @@ import (
 )
 
 // initStatusInfra builds the per-object desired-status collections and the per-GVK status
-// writers. Desired statuses are derived from the merged report singletons using the same
-// builders as before; writes go through the istio kclient (the same informer cache that
-// translation reads from), eliminating the second (controller-runtime) cache from the
-// status path.
+// writers. Gateway API statuses are derived from per-Gateway report fragments, while
+// backend and policy statuses use their specialized merged reports. Writes go through
+// the istio kclient (the same informer cache that translation reads from), eliminating
+// the second (controller-runtime) cache from the status path.
 func (s *ProxySyncer) initStatusInfra(ctx context.Context, krtopts krtutil.KrtOptions) {
 	s.statusCollections = statussync.NewStatusCollections()
 	s.statusWriters = map[schema.GroupVersionKind]statussync.ResourceStatusSyncer{}
@@ -44,16 +44,19 @@ func (s *ProxySyncer) initStatusInfra(ctx context.Context, krtopts krtutil.KrtOp
 	f := kclient.Filter{ObjectFilter: cl.ObjectFilter()}
 	controllerName := s.controllerName
 
-	gatewayReports := s.statusReport.AsCollection()
+	statusReportFragments, statusReportIndex := newStatusReportFragments(s.mostXdsSnapshots, krtopts)
 	backendReports := s.backendStatusReport.AsCollection()
 
 	// Gateway
 	gatewayStatuses := krt.NewCollection(s.commonCols.RawGateways, func(kctx krt.HandlerContext, gw *gwv1.Gateway) *krt.ObjectWithStatus[*gwv1.Gateway, gwv1.GatewayStatus] {
-		rw := krt.FetchOne(kctx, gatewayReports)
-		if rw == nil {
+		nn := types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}
+		rm := fetchStatusReport(kctx, statusReportFragments, statusReportIndex, statusReportKey{
+			GroupKind:      wellknown.GatewayGVK.GroupKind(),
+			NamespacedName: nn,
+		})
+		if rm == nil {
 			return nil
 		}
-		rm := rw.Reports()
 		status := rm.BuildGWStatus(ctx, *gw, nil)
 		if status == nil {
 			// Not in the report: not translated by us (e.g. another controller's Gateway).
@@ -79,14 +82,10 @@ func (s *ProxySyncer) initStatusInfra(ctx context.Context, krtopts krtutil.KrtOp
 
 	// Routes. Desired statuses carry the full RouteStatus (including preserved entries from
 	// other controllers, merged again at write time from the freshest informer state).
-	registerRouteStatus(s, ctx, krtopts, wellknown.HTTPRouteGVK, s.commonCols.RawHTTPRoutes,
-		func(rm reports.ReportMap, nn types.NamespacedName) bool { return rm.HTTPRoutes[nn] != nil })
-	registerRouteStatus(s, ctx, krtopts, wellknown.GRPCRouteGVK, s.commonCols.RawGRPCRoutes,
-		func(rm reports.ReportMap, nn types.NamespacedName) bool { return rm.GRPCRoutes[nn] != nil })
-	registerRouteStatus(s, ctx, krtopts, wellknown.TCPRouteGVK, s.commonCols.RawTCPRoutes,
-		func(rm reports.ReportMap, nn types.NamespacedName) bool { return rm.TCPRoutes[nn] != nil })
-	registerRouteStatus(s, ctx, krtopts, wellknown.TLSRouteGVK, s.commonCols.RawTLSRoutes,
-		func(rm reports.ReportMap, nn types.NamespacedName) bool { return rm.TLSRoutes[nn] != nil })
+	registerRouteStatus(s, ctx, krtopts, wellknown.HTTPRouteGVK, s.commonCols.RawHTTPRoutes, statusReportFragments, statusReportIndex)
+	registerRouteStatus(s, ctx, krtopts, wellknown.GRPCRouteGVK, s.commonCols.RawGRPCRoutes, statusReportFragments, statusReportIndex)
+	registerRouteStatus(s, ctx, krtopts, wellknown.TCPRouteGVK, s.commonCols.RawTCPRoutes, statusReportFragments, statusReportIndex)
+	registerRouteStatus(s, ctx, krtopts, wellknown.TLSRouteGVK, s.commonCols.RawTLSRoutes, statusReportFragments, statusReportIndex)
 
 	s.statusWriters[wellknown.HTTPRouteGVK] = routeWriter[*gwv1.HTTPRoute](cl, f, "httpRoute", wellknown.HTTPRouteGVR, wellknown.HTTPRouteKind, controllerName,
 		func(om metav1.ObjectMeta, st gwv1.RouteStatus) *gwv1.HTTPRoute {
@@ -160,14 +159,17 @@ func (s *ProxySyncer) initStatusInfra(ctx context.Context, krtopts krtutil.KrtOp
 	// ListenerSet (promoted and legacy XListenerSet variants share one collection; the
 	// legacy variant is distinguished by its preserved GroupVersionKind).
 	listenerSetStatuses := krt.NewCollection(s.commonCols.RawListenerSets, func(kctx krt.HandlerContext, ls *gwv1.ListenerSet) *krt.ObjectWithStatus[*gwv1.ListenerSet, gwv1.ListenerSetStatus] {
-		rw := krt.FetchOne(kctx, gatewayReports)
-		if rw == nil {
-			return nil
-		}
-		rm := rw.Reports()
 		lsCopy := *ls
 		if lsCopy.GroupVersionKind().Empty() {
 			lsCopy.SetGroupVersionKind(wellknown.ListenerSetGVK)
+		}
+		nn := types.NamespacedName{Namespace: ls.Namespace, Name: ls.Name}
+		rm := fetchStatusReport(kctx, statusReportFragments, statusReportIndex, statusReportKey{
+			GroupKind:      lsCopy.GroupVersionKind().GroupKind(),
+			NamespacedName: nn,
+		})
+		if rm == nil {
+			return nil
 		}
 		status := rm.BuildListenerSetStatus(ctx, lsCopy)
 		if status == nil {
@@ -230,6 +232,7 @@ func (s *ProxySyncer) initStatusInfra(ctx context.Context, krtopts krtutil.KrtOp
 	}
 
 	s.waitForSync = append(s.waitForSync,
+		statusReportFragments.HasSynced,
 		gatewayStatuses.HasSynced,
 		listenerSetStatuses.HasSynced,
 		backendStatuses.HasSynced,
@@ -244,21 +247,26 @@ func registerRouteStatus[T controllers.ComparableObject](
 	krtopts krtutil.KrtOptions,
 	gvk schema.GroupVersionKind,
 	col krt.Collection[T],
-	hasReport func(rm reports.ReportMap, nn types.NamespacedName) bool,
+	statusReportFragments krt.Collection[statusReportFragment],
+	statusReportIndex krt.Index[statusReportKey, statusReportFragment],
 ) {
-	gatewayReports := s.statusReport.AsCollection()
 	controllerName := s.controllerName
 	statuses := krt.NewCollection(col, func(kctx krt.HandlerContext, route T) *krt.ObjectWithStatus[T, gwv1.RouteStatus] {
-		rw := krt.FetchOne(kctx, gatewayReports)
-		if rw == nil {
-			return nil
-		}
-		rm := rw.Reports()
 		nn := types.NamespacedName{Namespace: route.GetNamespace(), Name: route.GetName()}
-		// Skip routes with no report entry (e.g. routes owned by another controller) to
-		// avoid building (and logging about) statuses we will never write.
-		if !hasReport(rm, nn) {
-			return nil
+		rm := fetchStatusReport(kctx, statusReportFragments, statusReportIndex, statusReportKey{
+			GroupKind:      gvk.GroupKind(),
+			NamespacedName: nn,
+		})
+		if rm == nil {
+			// A route can have no current translation fragment while retaining stale
+			// status owned by this controller. Preserve the existing marker behavior by
+			// synthesizing an empty report for only that route.
+			if !s.commonCols.Routes.HasRouteStatusMarker(kctx, gvk, nn) {
+				return nil
+			}
+			empty := reports.NewReportMap()
+			_ = reports.NewReporter(&empty).Route(route)
+			rm = &empty
 		}
 		status := rm.BuildRouteStatus(ctx, route, controllerName)
 		if status == nil {
