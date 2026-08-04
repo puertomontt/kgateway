@@ -19,7 +19,16 @@ var _ manager.LeaderElectionRunnable = &StatusSyncer{}
 
 // statusSyncMaxWorkers bounds the number of concurrent status writes; the worker queue
 // additionally guarantees at most one in-flight write per resource.
-const statusSyncMaxWorkers = 100
+//
+// Keep this low. The queue coalesces per resource only while an entry is pending or in
+// flight, so concurrency decides how much of that coalescing actually happens. Status for
+// one object is built up across several Gateway translations, and a high worker count
+// publishes each intermediate value instead of collapsing them: measured at 10k routes,
+// 100 workers wrote 8.3 statuses per route and 3.3k Gateway statuses, while 2 workers wrote
+// exactly 1.00 per route and 57 Gateway statuses, matching what the pre-KRT syncer achieved
+// by only ever reading the newest merged report. Peak RSS dropped with it (6.3GiB -> 4.0GiB)
+// because far fewer statuses are in flight at once.
+const statusSyncMaxWorkers = 2
 
 // StatusSyncer runs only on the leader and writes the status of resources.
 //
