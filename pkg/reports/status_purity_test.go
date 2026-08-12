@@ -157,10 +157,37 @@ func TestBuildListenerSetStatusDoesNotMutateReportMapEntry(t *testing.T) {
 	lsr := rm.ListenerSet(listenerSet)
 	before := cloneListenerSetReport(lsr)
 
-	status := BuildListenerSetStatus(lsr, *listenerSet)
+	status := BuildListenerSetStatus(lsr, *listenerSet, nil)
 	require.NotNil(t, status)
 
 	require.Equal(t, before, lsr, "BuildListenerSetStatus must not mutate ListenerSetReport")
+}
+
+func TestBuildListenerSetStatusAttachedRoutesOverride(t *testing.T) {
+	rm := NewReportMap()
+	rep := NewReporter(&rm)
+	listenerSet := &gwv1.ListenerSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "listeners", Namespace: "default", Generation: 1},
+		Spec: gwv1.ListenerSetSpec{Listeners: []gwv1.ListenerEntry{
+			{Name: "http", Port: 80, Protocol: gwv1.HTTPProtocolType},
+			{Name: "empty", Port: 81, Protocol: gwv1.HTTPProtocolType},
+		}},
+	}
+	// AttachedRoutes is never set on the report itself: the count is supplied
+	// entirely by the attachedRoutes override, matching what deleting
+	// setAttachedRoutes from translation leaves behind.
+	rep.ListenerSet(listenerSet)
+	lsr := rm.ListenerSet(listenerSet)
+
+	status := BuildListenerSetStatus(lsr, *listenerSet, map[string]uint{"http": 3})
+	require.NotNil(t, status)
+
+	byName := map[string]int32{}
+	for _, l := range status.Listeners {
+		byName[string(l.Name)] = l.AttachedRoutes
+	}
+	require.Equal(t, int32(3), byName["http"], "override entry must set AttachedRoutes")
+	require.Equal(t, int32(0), byName["empty"], "listener absent from the override must fall back to zero, not stay unset")
 }
 
 func slicesCloneConditions(in []metav1.Condition) []metav1.Condition {

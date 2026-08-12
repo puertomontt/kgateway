@@ -428,7 +428,7 @@ func TestListenerSetStatusStampsObservedGenerationFromReport(t *testing.T) {
 		statusReporter.ListenerSet(ls)
 
 		ls.Generation = 1
-		status := rm.BuildListenerSetStatus(*ls)
+		status := rm.BuildListenerSetStatus(*ls, nil)
 		requireAllObservedGenerations(t, status, 2)
 	})
 
@@ -442,7 +442,7 @@ func TestListenerSetStatusStampsObservedGenerationFromReport(t *testing.T) {
 		statusReporter.ListenerSet(ls)
 
 		ls.Generation = 2
-		status := rm.BuildListenerSetStatus(*ls)
+		status := rm.BuildListenerSetStatus(*ls, nil)
 		requireAllObservedGenerations(t, status, 1)
 	})
 }

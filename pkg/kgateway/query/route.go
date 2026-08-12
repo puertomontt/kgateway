@@ -357,15 +357,7 @@ func (r *gatewayQueries) GetRoutesForResource(kctx krt.HandlerContext, ctx conte
 	// Process each route
 	ret := NewRoutesForGwResult()
 
-	gvk := resource.GetObjectKind().GroupVersionKind()
-	if gvk.Empty() {
-		switch resource.(type) {
-		case *gwv1.Gateway:
-			gvk = wellknown.GatewayGVK
-		case *gwv1.ListenerSet:
-			gvk = wellknown.ListenerSetGVK
-		}
-	}
+	gvk := resourceGVK(resource)
 
 	routes := r.collections.Routes.RoutesFor(kctx, nns, gvk.Group, gvk.Kind)
 
@@ -422,6 +414,94 @@ func getListeners(resource client.Object) ([]gwv1.Listener, error) {
 	return listeners, nil
 }
 
+// attachOutcome records how far a (route, parentRef, listener) triple got through
+// attachment evaluation. Each stage implies the ones before it, so callers can both
+// decide whether the route fully attaches (attaches()) and, when it does not, tell
+// which stage rejected it -- the three RouteError reasons in processRoute each
+// correspond to one of these stages never being reached.
+type attachOutcome struct {
+	// allowedByListener is true once the route's kind and namespace pass the
+	// listener's allowedRoutes filter.
+	allowedByListener bool
+	// listenerMatched is true once the parentRef's port/sectionName match this
+	// listener. Implies allowedByListener.
+	listenerMatched bool
+	// hostnameChecked is true only when the route kind carries hostnames and the
+	// type assertion to the concrete route IR succeeded, i.e. a hostname check
+	// actually ran. Route kinds without hostnames (and the defensive case where
+	// the type assertion fails) never set this, matching processRoute's original
+	// behavior of skipping the check entirely rather than failing it.
+	hostnameChecked bool
+	// hostnameOK is true when no hostname check applies, or when one ran and the
+	// route's hostnames intersect the listener's. False only when a check ran and
+	// found no intersection.
+	hostnameOK bool
+	// hostnames are the (possibly narrowed) hostnames to use for this route on
+	// this listener, populated when a hostname check ran and passed.
+	hostnames []string
+}
+
+// attaches reports whether the route fully attaches to the listener under this ref.
+func (o attachOutcome) attaches() bool {
+	return o.allowedByListener && o.listenerMatched && o.hostnameOK
+}
+
+// attachOutcomeForListener evaluates whether route attaches to listener l under ref,
+// without resolving backends or delegated children. It is the single source of truth
+// for attachment shared by processRoute (which additionally resolves the route chain
+// on success) and the attached-route counters, which only need the boolean outcome.
+func (r *gatewayQueries) attachOutcomeForListener(
+	kctx krt.HandlerContext,
+	resource client.Object,
+	route ir.Route,
+	ref gwv1.ParentReference,
+	l *gwv1.Listener,
+) (attachOutcome, error) {
+	var out attachOutcome
+	routeKind := route.GetGroupKind().Kind
+
+	allowedNs, allowedKinds, err := r.allowedRoutes(resource, l)
+	if err != nil {
+		return out, err
+	}
+
+	// Check if the kind of the route is allowed by the listener
+	if !isKindAllowed(routeKind, allowedKinds) {
+		return out, nil
+	}
+
+	// Check if the namespace of the route is allowed by the listener
+	if !allowedNs(kctx, route.GetNamespace()) {
+		return out, nil
+	}
+	out.allowedByListener = true
+
+	// Check if the listener matches the route's parent reference
+	if !parentRefMatchListener(&ref, l) {
+		return out, nil
+	}
+	out.listenerMatched = true
+
+	// If the route is an HTTP or TLS Route, check the hostname intersection
+	switch routeKind {
+	case wellknown.HTTPRouteKind, wellknown.GRPCRouteKind:
+		if hr, ok := route.(*ir.HttpRouteIR); ok {
+			out.hostnameChecked = true
+			out.hostnameOK, out.hostnames = hostnameIntersect(l, hr.GetHostnames())
+		}
+	case wellknown.TLSRouteKind:
+		if tr, ok := route.(*ir.TlsRouteIR); ok {
+			out.hostnameChecked = true
+			out.hostnameOK, out.hostnames = hostnameIntersect(l, tr.GetHostnames())
+		}
+	}
+	if !out.hostnameChecked {
+		out.hostnameOK = true
+	}
+
+	return out, nil
+}
+
 func (r *gatewayQueries) processRoute(
 	kctx krt.HandlerContext,
 	ctx context.Context,
@@ -449,64 +529,30 @@ func (r *gatewayQueries) processRoute(
 				ret.setListenerResult(resource, string(l.Name), lr)
 			}
 
-			allowedNs, allowedKinds, err := r.allowedRoutes(resource, &l)
+			outcome, err := r.attachOutcomeForListener(kctx, resource, route, ref, &l)
 			if err != nil {
 				lr.Error = err
 				continue
 			}
-
-			// Check if the kind of the route is allowed by the listener
-			if !isKindAllowed(routeKind, allowedKinds) {
-				continue
-			}
-
-			// Check if the namespace of the route is allowed by the listener
-			if !allowedNs(kctx, route.GetNamespace()) {
+			if !outcome.allowedByListener {
 				continue
 			}
 			anyRoutesAllowed = true
 
-			// Check if the listener matches the route's parent reference
-			if !parentRefMatchListener(&ref, &l) {
+			if !outcome.listenerMatched {
 				continue
 			}
 			anyListenerMatched = true
 
-			// If the route is an HTTP or TLS Route, check the hostname intersection
-			var hostnames []string
-			if routeKind == wellknown.HTTPRouteKind {
-				if hr, ok := route.(*ir.HttpRouteIR); ok {
-					var ok bool
-					ok, hostnames = hostnameIntersect(&l, hr.GetHostnames())
-					if !ok {
-						continue
-					}
-					anyHostsMatch = true
-				}
+			if outcome.hostnameChecked && outcome.hostnameOK {
+				anyHostsMatch = true
 			}
-			if routeKind == wellknown.TLSRouteKind {
-				if tr, ok := route.(*ir.TlsRouteIR); ok {
-					var ok bool
-					ok, hostnames = hostnameIntersect(&l, tr.GetHostnames())
-					if !ok {
-						continue
-					}
-					anyHostsMatch = true
-				}
-			}
-			if routeKind == wellknown.GRPCRouteKind {
-				if gr, ok := route.(*ir.HttpRouteIR); ok {
-					var ok bool
-					ok, hostnames = hostnameIntersect(&l, gr.GetHostnames())
-					if !ok {
-						continue
-					}
-					anyHostsMatch = true
-				}
+			if !outcome.hostnameOK {
+				continue
 			}
 
 			// If all checks pass, add the route to the listener result
-			lr.Routes = append(lr.Routes, r.GetRouteChain(kctx, ctx, route, hostnames, ref))
+			lr.Routes = append(lr.Routes, r.GetRouteChain(kctx, ctx, route, outcome.hostnames, ref))
 		}
 
 		// Handle route errors based on checks

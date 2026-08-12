@@ -45,6 +45,12 @@ func (r *ReportMap) BuildGWStatus(gw gwv1.Gateway, attachedRoutes map[string]uin
 }
 
 // BuildGWStatus builds a Gateway status directly from its typed report fragment.
+// attachedRoutes, when non-nil, overrides the AttachedRoutes count for any listener
+// name it contains; a missing entry falls back to whatever the report carries
+// (translation no longer sets AttachedRoutes on the report at all, so that fallback
+// is always zero). The override exists because AttachedRoutes is computed by a
+// separate, route-indexed collection so that route churn doesn't force this
+// Gateway's report -- and therefore its status write -- to change.
 func BuildGWStatus(gwReport *GatewayReport, gw gwv1.Gateway, attachedRoutes map[string]uint) *gwv1.GatewayStatus {
 	if gwReport == nil {
 		return nil
@@ -273,12 +279,15 @@ func shouldPreserveGatewayCondition(condition metav1.Condition, finalConditions 
 	return !isReporterOwnedGatewayConditionType(gwv1.GatewayConditionType(condition.Type))
 }
 
-func (r *ReportMap) BuildListenerSetStatus(ls gwv1.ListenerSet) *gwv1.ListenerSetStatus {
-	return BuildListenerSetStatus(r.ListenerSet(&ls), ls)
+func (r *ReportMap) BuildListenerSetStatus(ls gwv1.ListenerSet, attachedRoutes map[string]uint) *gwv1.ListenerSetStatus {
+	return BuildListenerSetStatus(r.ListenerSet(&ls), ls, attachedRoutes)
 }
 
-// BuildListenerSetStatus builds a ListenerSet status directly from its typed report fragment.
-func BuildListenerSetStatus(lsReport *ListenerSetReport, ls gwv1.ListenerSet) *gwv1.ListenerSetStatus {
+// BuildListenerSetStatus builds a ListenerSet status directly from its typed report
+// fragment. attachedRoutes, when non-nil, overrides the AttachedRoutes count for any
+// listener name it contains -- see BuildGWStatus for why this exists as an override
+// rather than always being sourced from the report.
+func BuildListenerSetStatus(lsReport *ListenerSetReport, ls gwv1.ListenerSet, attachedRoutes map[string]uint) *gwv1.ListenerSetStatus {
 	if lsReport == nil {
 		return nil
 	}
@@ -299,6 +308,11 @@ func BuildListenerSetStatus(lsReport *ListenerSetReport, ls gwv1.ListenerSet) *g
 		for _, l := range ls.Spec.Listeners {
 			lis := utils.ToListener(l)
 			listenerStatus := listenerStatusFromListenerSetReport(lsReport, lis)
+			if attachedRoutes != nil {
+				if count, exists := attachedRoutes[string(lis.Name)]; exists {
+					listenerStatus.AttachedRoutes = int32(count) //nolint:gosec // G115: route count is always non-negative
+				}
+			}
 
 			finalConditions := make([]metav1.Condition, 0, len(listenerStatus.Conditions))
 			oldLisStatusIndex := slices.IndexFunc(ls.Status.Listeners, func(l gwv1.ListenerEntryStatus) bool {

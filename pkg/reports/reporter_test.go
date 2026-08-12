@@ -719,7 +719,7 @@ var _ = Describe("Reporting Infrastructure", func() {
 			// initialize ListenerSetReporter to mimic translation loop (i.e. report gets initialized for all GWs)
 			reporter.ListenerSet(ls)
 
-			status := rm.BuildListenerSetStatus(*ls)
+			status := rm.BuildListenerSetStatus(*ls, nil)
 
 			Expect(status).NotTo(BeNil())
 			Expect(status.Conditions).To(HaveLen(2))
@@ -739,7 +739,7 @@ var _ = Describe("Reporting Infrastructure", func() {
 			// initialize ListenerSetReporter to mimic translation loop (i.e. report gets initialized for all GWs)
 			reporter.ListenerSet(ls)
 
-			status := rm.BuildListenerSetStatus(*ls)
+			status := rm.BuildListenerSetStatus(*ls, nil)
 
 			Expect(status).NotTo(BeNil())
 			Expect(status.Conditions).To(HaveLen(3)) // 2 from the report, 1 from the original status
@@ -756,7 +756,7 @@ var _ = Describe("Reporting Infrastructure", func() {
 				Status: metav1.ConditionFalse,
 				Reason: gwv1.GatewayReasonAddressNotUsable,
 			})
-			status := rm.BuildListenerSetStatus(*ls)
+			status := rm.BuildListenerSetStatus(*ls, nil)
 
 			Expect(status).NotTo(BeNil())
 			Expect(status.Conditions).To(HaveLen(2))
@@ -776,7 +776,7 @@ var _ = Describe("Reporting Infrastructure", func() {
 				Status: metav1.ConditionFalse,
 				Reason: gwv1.ListenerReasonInvalidRouteKinds,
 			})
-			status := rm.BuildListenerSetStatus(*ls)
+			status := rm.BuildListenerSetStatus(*ls, nil)
 
 			Expect(status).NotTo(BeNil())
 			Expect(status.Conditions).To(HaveLen(2))
@@ -795,7 +795,7 @@ var _ = Describe("Reporting Infrastructure", func() {
 			// initialize ListenerSetReporter to mimic translation loop (i.e. report gets initialized for all GWs)
 			reporter.ListenerSet(ls)
 
-			status := rm.BuildListenerSetStatus(*ls)
+			status := rm.BuildListenerSetStatus(*ls, nil)
 
 			Expect(status).NotTo(BeNil())
 			Expect(status.Conditions).To(HaveLen(2))
@@ -806,7 +806,7 @@ var _ = Describe("Reporting Infrastructure", func() {
 			oldTransitionTime := acceptedCond.LastTransitionTime
 
 			ls.Status = *status
-			status = rm.BuildListenerSetStatus(*ls)
+			status = rm.BuildListenerSetStatus(*ls, nil)
 
 			Expect(status).NotTo(BeNil())
 			Expect(status.Conditions).To(HaveLen(2))
@@ -835,7 +835,7 @@ var _ = Describe("Reporting Infrastructure", func() {
 				Reason: gwv1.GatewayConditionReason(gwv1.ListenerSetReasonNotAllowed),
 			})
 
-			status := rm.BuildListenerSetStatus(*ls)
+			status := rm.BuildListenerSetStatus(*ls, nil)
 
 			Expect(status).NotTo(BeNil())
 			Expect(status.Conditions).To(HaveLen(2))

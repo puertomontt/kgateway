@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	"istio.io/istio/pkg/kube/krt"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -14,6 +15,8 @@ import (
 
 	"github.com/kgateway-dev/kgateway/v2/api/v1alpha1/kgateway"
 	"github.com/kgateway-dev/kgateway/v2/pkg/kgateway/extensions2/plugins/backendtlspolicy"
+	"github.com/kgateway-dev/kgateway/v2/pkg/kgateway/proxy_syncer"
+	"github.com/kgateway-dev/kgateway/v2/pkg/kgateway/query"
 	"github.com/kgateway-dev/kgateway/v2/pkg/kgateway/wellknown"
 	pluginreporter "github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/reporter"
 	"github.com/kgateway-dev/kgateway/v2/pkg/reports"
@@ -34,6 +37,7 @@ func buildStatusesFromReports(
 	reportsMap reports.ReportMap,
 	gateways map[types.NamespacedName]*gwv1.Gateway,
 	listenerSets map[types.NamespacedName]*gwv1.ListenerSet,
+	attachedRoutes krt.Collection[query.TargetAttachedRoutes],
 ) *Statuses {
 	// Fixed values for deterministic golden file tests. Use the zero time
 	// for consistency and to avoid confusion about the significance of a
@@ -66,7 +70,8 @@ func buildStatusesFromReports(
 				},
 			}
 		}
-		if status := reportsMap.BuildGWStatus(gw, nil); status != nil {
+		counts := proxy_syncer.AttachedRoutesFor(attachedRoutes, wellknown.GatewayGVK.GroupKind(), gwNN)
+		if status := reportsMap.BuildGWStatus(gw, counts); status != nil {
 			normalizeStatus(status, fixedTime)
 			statuses.Gateways[gwNN.String()] = status
 		}
@@ -91,7 +96,8 @@ func buildStatusesFromReports(
 			if listenerSet.GroupVersionKind().Empty() {
 				listenerSet.SetGroupVersionKind(gvk)
 			}
-			if status := reportsMap.BuildListenerSetStatus(listenerSet); status != nil {
+			counts := proxy_syncer.AttachedRoutesFor(attachedRoutes, gvk.GroupKind(), listenerSetNN)
+			if status := reportsMap.BuildListenerSetStatus(listenerSet, counts); status != nil {
 				normalizeListenerSetStatus(status, fixedTime)
 				statuses.ListenerSets[listenerSetNN.String()] = status
 			}

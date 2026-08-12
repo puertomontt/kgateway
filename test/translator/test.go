@@ -308,7 +308,7 @@ func TestTranslationWithExtraPlugins(
 		ExtraClusters: result.Proxy.ExtraClusters,
 		Clusters:      result.Clusters,
 		Secrets:       result.Proxy.Secrets,
-		Statuses:      buildStatusesFromReports(result.ReportsMap, result.Gateways, result.ListenerSets),
+		Statuses:      buildStatusesFromReports(result.ReportsMap, result.Gateways, result.ListenerSets, result.AttachedRoutes),
 	}
 	outputYaml, err := testutils.MarshalAnyYaml(output)
 	r.NoErrorf(err, "error marshaling output to YAML; actual result: %s", outputYaml)
@@ -341,12 +341,13 @@ type TestCase struct {
 }
 
 type ActualTestResult struct {
-	Proxy         *irtranslator.TranslationResult
-	ReportsMap    reports.ReportMap
-	Gateways      map[types.NamespacedName]*gwv1.Gateway
-	ListenerSets  map[types.NamespacedName]*gwv1.ListenerSet
-	PolicyPlugins map[schema.GroupKind]pluginsdk.PolicyPlugin
-	Clusters      []*envoyclusterv3.Cluster
+	Proxy          *irtranslator.TranslationResult
+	ReportsMap     reports.ReportMap
+	Gateways       map[types.NamespacedName]*gwv1.Gateway
+	ListenerSets   map[types.NamespacedName]*gwv1.ListenerSet
+	AttachedRoutes krt.Collection[query.TargetAttachedRoutes]
+	PolicyPlugins  map[schema.GroupKind]pluginsdk.PolicyPlugin
+	Clusters       []*envoyclusterv3.Cluster
 }
 
 func compareProxy(expectedFile string, actualProxy *irtranslator.TranslationResult) (string, error) {
@@ -632,7 +633,7 @@ func AreReportsSuccess(gwNN types.NamespacedName, reportsMap reports.ReportMap) 
 				},
 			}
 			l.SetGroupVersionKind(gvk)
-			status := reportsMap.BuildListenerSetStatus(l)
+			status := reportsMap.BuildListenerSetStatus(l, nil)
 			for _, c := range status.Conditions {
 				if c.Status != metav1.ConditionTrue {
 					return fmt.Errorf("condition not accepted for listenerSet %s condition: %v", ls, c)
@@ -800,6 +801,12 @@ func (tc TestCase) Run(
 	results := make(map[types.NamespacedName]ActualTestResult)
 	queries := query.NewData(commoncol)
 
+	// Computed the same way production wires it (query.NewTargetAttachedRoutes),
+	// so golden AttachedRoutes counts exercise the real counting path instead of
+	// being derived a second, divergent way just for tests.
+	targetAttachedRoutes := query.NewTargetAttachedRoutes(krtOpts, commoncol)
+	kubeclient.WaitForCacheSync("targetAttachedRoutes", ctx.Done(), targetAttachedRoutes.HasSynced)
+
 	// Build a map of all gateways by NamespacedName for status building
 	gatewayMap := make(map[types.NamespacedName]*gwv1.Gateway)
 	for _, gw := range commoncol.GatewayIndex.Gateways.List() {
@@ -864,11 +871,12 @@ func (tc TestCase) Run(
 			Name:      gw.Name,
 		}
 		actual := ActualTestResult{
-			Proxy:         xdsSnap,
-			ReportsMap:    mergedReports,
-			Gateways:      gatewayMap,
-			ListenerSets:  listenerSetMap,
-			PolicyPlugins: extensions.ContributesPolicies,
+			Proxy:          xdsSnap,
+			ReportsMap:     mergedReports,
+			Gateways:       gatewayMap,
+			ListenerSets:   listenerSetMap,
+			AttachedRoutes: targetAttachedRoutes,
+			PolicyPlugins:  extensions.ContributesPolicies,
 		}
 		results[gwNN] = actual
 
