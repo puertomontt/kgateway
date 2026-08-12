@@ -141,7 +141,6 @@ type ListenerSetReporter interface {
 type ListenerReporter interface {
 	SetCondition(ListenerCondition)
 	SetSupportedKinds([]gwv1.RouteGroupKind)
-	SetAttachedRoutes(n uint)
 }
 
 type RouteReporter interface {

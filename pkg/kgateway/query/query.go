@@ -197,6 +197,25 @@ func getParentRefsForResource(resource client.Object, obj ir.Route) []gwv1.Paren
 	return ret
 }
 
+// resourceGVK returns resource's GroupVersionKind, defaulting to the well-known
+// Gateway or ListenerSet GVK when the object's TypeMeta is unset -- typical for a
+// *gwv1.Gateway read straight from its informer, but not for the ListenerSet
+// collection, which stamps the promoted GVK on read (see GatewaysForEnvoyTransformationFunc).
+// The resource must be either a Gateway or a ListenerSet.
+func resourceGVK(resource client.Object) schema.GroupVersionKind {
+	gvk := resource.GetObjectKind().GroupVersionKind()
+	if !gvk.Empty() {
+		return gvk
+	}
+	switch resource.(type) {
+	case *gwv1.Gateway:
+		return wellknown.GatewayGVK
+	case *gwv1.ListenerSet:
+		return wellknown.ListenerSetGVK
+	}
+	return gvk
+}
+
 // isParentRefForResource checks if a ParentReference is associated with the provided resource.
 // The resource must either be a Gateway or a ListenerSet
 func isParentRefForResource(pRef *gwv1.ParentReference, resource client.Object, defaultNs string) bool {
@@ -204,15 +223,7 @@ func isParentRefForResource(pRef *gwv1.ParentReference, resource client.Object, 
 		return false
 	}
 
-	gvk := resource.GetObjectKind().GroupVersionKind()
-	if gvk.Empty() {
-		switch resource.(type) {
-		case *gwv1.Gateway:
-			gvk = wellknown.GatewayGVK
-		case *gwv1.ListenerSet:
-			gvk = wellknown.ListenerSetGVK
-		}
-	}
+	gvk := resourceGVK(resource)
 
 	if pRef.Group != nil && *pRef.Group != gwv1.Group(gvk.Group) {
 		return false

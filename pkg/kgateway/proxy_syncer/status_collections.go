@@ -22,6 +22,7 @@ import (
 	"github.com/kgateway-dev/kgateway/v2/api/conditions"
 	"github.com/kgateway-dev/kgateway/v2/api/v1alpha1/kgateway"
 	"github.com/kgateway-dev/kgateway/v2/pkg/apiclient"
+	"github.com/kgateway-dev/kgateway/v2/pkg/kgateway/query"
 	"github.com/kgateway-dev/kgateway/v2/pkg/kgateway/wellknown"
 	kmetrics "github.com/kgateway-dev/kgateway/v2/pkg/krtcollections/metrics"
 	"github.com/kgateway-dev/kgateway/v2/pkg/metrics"
@@ -47,10 +48,15 @@ func (s *ProxySyncer) initStatusInfra(krtopts krtutil.KrtOptions) {
 	})
 	contributionsByTarget := s.statusContributionsByTarget
 
+	// AttachedRoutes is computed independently of Gateway/ListenerSet translation
+	// (see query.NewTargetAttachedRoutes) so that route churn updates only this
+	// derived collection, not the Gateway/ListenerSet status report itself.
+	targetAttachedRoutes := query.NewTargetAttachedRoutes(krtopts, s.commonCols)
+
 	// Gateway
 	gatewayReports := statussync.RegisterKind(s.statusCollections, wellknown.GatewayGVK, s.commonCols.RawGateways,
 		s.statusContributions, contributionsByTarget, krtopts.ToOptions("GatewayStatusReports")...)
-	s.statusWriters[wellknown.GatewayGVK] = gatewayWriter(cl, f, s.commonCols.RawGateways, gatewayReports)
+	s.statusWriters[wellknown.GatewayGVK] = gatewayWriter(cl, f, s.commonCols.RawGateways, gatewayReports, targetAttachedRoutes)
 
 	httpRouteReports := statussync.RegisterKind(s.statusCollections, wellknown.HTTPRouteGVK, s.commonCols.RawHTTPRoutes,
 		s.statusContributions, contributionsByTarget, krtopts.ToOptions("HTTPRouteStatusReports")...)
@@ -145,10 +151,11 @@ func (s *ProxySyncer) initStatusInfra(krtopts krtutil.KrtOptions) {
 		s.commonCols.RawListenerSets, s.statusContributions, contributionsByTarget,
 		krtopts.ToOptions("ListenerSetStatusReports")...)
 	lsWriter := &listenerSetStatusSyncer{
-		col:      s.commonCols.RawListenerSets,
-		promoted: kclient.NewFilteredDelayed[*gwv1.ListenerSet](cl, wellknown.ListenerSetGVR, f),
-		client:   cl,
-		reports:  listenerSetReports,
+		col:            s.commonCols.RawListenerSets,
+		promoted:       kclient.NewFilteredDelayed[*gwv1.ListenerSet](cl, wellknown.ListenerSetGVR, f),
+		client:         cl,
+		reports:        listenerSetReports,
+		attachedRoutes: targetAttachedRoutes,
 	}
 	s.statusWriters[wellknown.ListenerSetGVK] = lsWriter
 	s.statusWriters[wellknown.XListenerSetGVK] = lsWriter
@@ -228,6 +235,24 @@ func registerStatusWriter(
 	writers[gvk] = syncer
 }
 
+// AttachedRoutesFor looks up the current AttachedRoutes counts for one status
+// target. col is nil-safe so callers, including tests that don't wire attached-route
+// counting at all, can pass a nil collection and get the "no override" behavior
+// (BuildGWStatus/BuildListenerSetStatus fall back to the report, which is zero).
+// Exported so the golden-output test harness can reproduce the same lookup outside
+// this package.
+func AttachedRoutesFor(col krt.Collection[query.TargetAttachedRoutes], gk schema.GroupKind, nn types.NamespacedName) map[string]uint {
+	if col == nil {
+		return nil
+	}
+	key := reports.StatusKey{GroupKind: gk, NamespacedName: nn}
+	tar := col.GetKey(key.String())
+	if tar == nil {
+		return nil
+	}
+	return tar.CountsByListener
+}
+
 // gatewayWriter constructs the Gateway status writer, wiring the deployer-owned address
 // merge and the Gateway status sync metrics. It is a function rather than a literal inside
 // initStatusInfra so tests can exercise the writer this controller actually runs — the
@@ -238,16 +263,19 @@ func gatewayWriter(
 	f kclient.Filter,
 	gateways krt.Collection[*gwv1.Gateway],
 	reportCol krt.Collection[statussync.ResourceReports],
+	attachedRoutes krt.Collection[query.TargetAttachedRoutes],
 ) statussync.Writer[*gwv1.Gateway, gwv1.GatewayStatus] {
 	return statussync.Writer[*gwv1.Gateway, gwv1.GatewayStatus]{
 		Name:    "gateway",
 		Current: statussync.CollectionSource(gateways),
 		Desired: func(gw *gwv1.Gateway) (gwv1.GatewayStatus, bool) {
-			report, ok := statussync.ReportFor(reportCol, wellknown.GatewayGVK, types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name})
+			nn := types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}
+			report, ok := statussync.ReportFor(reportCol, wellknown.GatewayGVK, nn)
 			if !ok {
 				return gwv1.GatewayStatus{}, false
 			}
-			status := reports.BuildGWStatus(report.Gateway, *gw, nil)
+			counts := AttachedRoutesFor(attachedRoutes, wellknown.GatewayGVK.GroupKind(), nn)
+			status := reports.BuildGWStatus(report.Gateway, *gw, counts)
 			if status == nil {
 				return gwv1.GatewayStatus{}, false
 			}
@@ -471,10 +499,11 @@ func simpleStatusMetricsHook[T controllers.ComparableObject, S any](syncer, kind
 // through the typed client; legacy XListenerSets are written through the dynamic client
 // with the required per-listener port injected into the status payload.
 type listenerSetStatusSyncer struct {
-	col      krt.Collection[*gwv1.ListenerSet]
-	promoted kclient.Client[*gwv1.ListenerSet]
-	client   apiclient.Client
-	reports  krt.Collection[statussync.ResourceReports]
+	col            krt.Collection[*gwv1.ListenerSet]
+	promoted       kclient.Client[*gwv1.ListenerSet]
+	client         apiclient.Client
+	reports        krt.Collection[statussync.ResourceReports]
+	attachedRoutes krt.Collection[query.TargetAttachedRoutes]
 }
 
 func (s *listenerSetStatusSyncer) ApplyStatus(ctx context.Context, res statussync.Resource) {
@@ -500,7 +529,8 @@ func (s *listenerSetStatusSyncer) ApplyStatus(ctx context.Context, res statussyn
 		}
 		lsCopy := *current
 		lsCopy.SetGroupVersionKind(res.GroupVersionKind)
-		status := reports.BuildListenerSetStatus(report.ListenerSet, lsCopy)
+		counts := AttachedRoutesFor(s.attachedRoutes, res.GroupVersionKind.GroupKind(), res.NamespacedName)
+		status := reports.BuildListenerSetStatus(report.ListenerSet, lsCopy, counts)
 		if status == nil {
 			return nil
 		}

@@ -86,8 +86,6 @@ func (t *translator) Translate(
 		})
 	}
 
-	setAttachedRoutes(gateway, routesForGw, reporter)
-
 	listeners := listener.TranslateListeners(
 		kctx,
 		ctx,
@@ -104,19 +102,6 @@ func (t *translator) Translate(
 		AttachedPolicies:              gateway.AttachedListenerPolicies,
 		AttachedHttpPolicies:          gateway.AttachedHttpPolicies,
 		PerConnectionBufferLimitBytes: gateway.PerConnectionBufferLimitBytes,
-	}
-}
-
-func setAttachedRoutes(gateway *ir.Gateway, routesForGw *query.RoutesForGwResult, reporter reports.Reporter) {
-	for _, listener := range gateway.Listeners {
-		parentReporter := listener.GetParentReporter(reporter)
-
-		availRoutes := 0
-		if res := routesForGw.GetListenerResult(listener.Parent, string(listener.Name)); res != nil {
-			// TODO we've never checked if the ListenerResult has an error.. is it already on RouteErrors?
-			availRoutes = len(res.Routes)
-		}
-		parentReporter.Listener(&listener.Listener).SetAttachedRoutes(uint(availRoutes)) //nolint:gosec // G115: availRoutes is a count of routes, always non-negative
 	}
 }
 

@@ -221,7 +221,7 @@ func newStatusCycleFixture(t *testing.T) statusCycleFixture {
 	fixture := statusCycleFixture{
 		gateways:      gateways,
 		routes:        routes,
-		gatewayWriter: gatewayWriter(c, f, gateways, gatewayReports),
+		gatewayWriter: gatewayWriter(c, f, gateways, gatewayReports, nil),
 		routeWriter: routeWriter[*gwv1.HTTPRoute, *gwv1.HTTPRoute](c, f, routes, routeReports,
 			wellknown.HTTPRouteGVK, "httpRoute", wellknown.HTTPRouteGVR, wellknown.HTTPRouteKind, cycleController,
 			func(om metav1.ObjectMeta, st gwv1.RouteStatus) *gwv1.HTTPRoute {
