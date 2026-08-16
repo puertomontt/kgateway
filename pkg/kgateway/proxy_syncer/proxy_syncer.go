@@ -247,6 +247,8 @@ func (s *ProxySyncer) Init(ctx context.Context, krtopts krtutil.KrtOptions) {
 
 	s.translator.Init(ctx)
 
+	policyExtraClusters := newPolicyExtraClusters(krtopts, s.plugins)
+
 	translationOutputs := krt.NewCollection(s.commonCols.GatewayIndex.Gateways, func(kctx krt.HandlerContext, gw ir.Gateway) *gatewayTranslationOutput {
 		// Note: s.commonCols.GatewayIndex.Gateways is already filtered to only include Gateways
 		// with controllerName matching s.controllerName (envoy controller). The filtering happens
@@ -257,6 +259,10 @@ func (s *ProxySyncer) Init(ctx context.Context, krtopts krtutil.KrtOptions) {
 		if xdsSnap == nil {
 			return nil
 		}
+
+		// Clusters that policies refer to but backend translation never produces,
+		// such as the transport cluster reaching an SDS server.
+		xdsSnap.ExtraClusters = appendPolicyExtraClusters(xdsSnap.ExtraClusters, krt.FetchOne(kctx, policyExtraClusters.AsCollection()))
 
 		return toTranslationOutput(gw, *xdsSnap, rm)
 	}, krtopts.ToOptions("GatewayTranslationOutputs")...)

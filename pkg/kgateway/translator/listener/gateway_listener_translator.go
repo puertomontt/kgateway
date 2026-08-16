@@ -19,6 +19,7 @@ import (
 	"github.com/kgateway-dev/kgateway/v2/api/conditions"
 	"github.com/kgateway-dev/kgateway/v2/pkg/kgateway/extensions2/plugins/listenerpolicy"
 	"github.com/kgateway-dev/kgateway/v2/pkg/kgateway/query"
+	"github.com/kgateway-dev/kgateway/v2/pkg/kgateway/sdsref"
 	route "github.com/kgateway-dev/kgateway/v2/pkg/kgateway/translator/httproute"
 	"github.com/kgateway-dev/kgateway/v2/pkg/kgateway/translator/metrics"
 	"github.com/kgateway-dev/kgateway/v2/pkg/kgateway/translator/routeutils"
@@ -1050,6 +1051,20 @@ func translateTLSConfig(
 		)
 		if err != nil {
 			certErr = errors.Join(certErr, err)
+			continue
+		}
+
+		// An SDS reference carries no certificate material for us to validate or
+		// inline; the proxy fetches the certificate from the SDS server itself.
+		// Whether that server actually serves the named resource is not knowable
+		// from here, so a reference that parses is accepted.
+		if sdsref.IsRef(secret) {
+			sdsCfg, err := sdsref.Parse(secret)
+			if err != nil {
+				certErr = errors.Join(certErr, err)
+				continue
+			}
+			certificates = append(certificates, ir.TLSCertificate{SDS: sdsCfg})
 			continue
 		}
 

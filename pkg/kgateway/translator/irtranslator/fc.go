@@ -19,6 +19,7 @@ import (
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	"github.com/kgateway-dev/kgateway/v2/api/annotations"
+	"github.com/kgateway-dev/kgateway/v2/pkg/kgateway/sdsref"
 	"github.com/kgateway-dev/kgateway/v2/pkg/kgateway/utils"
 	"github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/filters"
 	"github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/ir"
@@ -531,6 +532,15 @@ func (info *FilterChainInfo) toTransportSocket() *envoycorev3.TransportSocket {
 	}
 
 	for _, certificate := range tlsConfig.Certificates {
+		// An SDS-backed certificate is fetched by the proxy at runtime rather than
+		// carried in the listener. Envoy rejects a context that sets both
+		// tls_certificates and tls_certificate_sds_secret_configs, and the IR keeps
+		// the two mutually exclusive, so each certificate contributes to exactly one.
+		if certificate.SDS != nil {
+			common.TlsCertificateSdsSecretConfigs = append(common.TlsCertificateSdsSecretConfigs,
+				sdsref.BuildSecretConfig(certificate.SDS.SecretName, certificate.SDS.SocketPath))
+			continue
+		}
 		common.TlsCertificates = append(common.TlsCertificates, &envoytlsv3.TlsCertificate{
 			CertificateChain: bytesDataSource(certificate.CertChain),
 			PrivateKey:       bytesDataSource(certificate.PrivateKey),

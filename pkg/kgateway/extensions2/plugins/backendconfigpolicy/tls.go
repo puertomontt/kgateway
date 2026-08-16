@@ -15,6 +15,7 @@ import (
 	"github.com/kgateway-dev/kgateway/v2/api/v1alpha1/kgateway"
 	eiutils "github.com/kgateway-dev/kgateway/v2/internal/envoyinit/pkg/utils"
 	"github.com/kgateway-dev/kgateway/v2/pkg/kgateway/extensions2/pluginutils"
+	"github.com/kgateway-dev/kgateway/v2/pkg/kgateway/sdsref"
 	"github.com/kgateway-dev/kgateway/v2/pkg/krtcollections"
 	"github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/ir"
 )
@@ -41,24 +42,31 @@ func (g *DefaultSecretGetter) GetSecret(name, namespace string) (*ir.Secret, err
 	return g.secrets.GetSecretWithoutRefGrant(g.krtctx, name, namespace)
 }
 
-func buildTLSContext(tlsConfig *kgateway.TLS, secretGetter SecretGetter, namespace string, tlsContext *envoytlsv3.CommonTlsContext) error {
+// buildTLSContext populates tlsContext and reports the SDS server sockets it
+// referenced, so the caller can publish the transport clusters that reach them.
+func buildTLSContext(tlsConfig *kgateway.TLS, secretGetter SecretGetter, namespace string, tlsContext *envoytlsv3.CommonTlsContext) ([]string, error) {
 	// Extract TLS data from config
 	tlsData, err := extractTLSData(tlsConfig, secretGetter, namespace)
 	if err != nil {
-		return fmt.Errorf("failed to extract TLS data: %w", err)
+		return nil, fmt.Errorf("failed to extract TLS data: %w", err)
+	}
+
+	var sdsSocketPaths []string
+	if tlsData.sds != nil {
+		sdsSocketPaths = []string{tlsData.sds.SocketPath}
 	}
 
 	// Skip client certificate processing for simple TLS
 	if tlsConfig.SimpleTLS != nil && *tlsConfig.SimpleTLS {
-		return buildValidationContext(tlsData, tlsConfig, tlsContext)
+		return sdsSocketPaths, buildValidationContext(tlsData, tlsConfig, tlsContext)
 	}
 
 	// Process client certificate for mutual TLS, if provided
 	if err := buildCertificateContext(tlsData, tlsContext); err != nil {
-		return err
+		return nil, err
 	}
 
-	return buildValidationContext(tlsData, tlsConfig, tlsContext)
+	return sdsSocketPaths, buildValidationContext(tlsData, tlsConfig, tlsContext)
 }
 
 type tlsData struct {
@@ -66,6 +74,11 @@ type tlsData struct {
 	privateKey       string
 	rootCA           string
 	inlineDataSource bool
+	// sds is set when secretRef names an SDS reference Secret rather than one
+	// carrying certificate material. It is mutually exclusive with the fields
+	// above: the proxy fetches the material from the SDS server, so there is
+	// nothing to inline or read from a file.
+	sds *ir.SDSConfig
 }
 
 func extractTLSData(tlsConfig *kgateway.TLS, secretGetter SecretGetter, namespace string) (*tlsData, error) {
@@ -88,6 +101,15 @@ func extractFromSecret(secretRef *corev1.LocalObjectReference, secretGetter Secr
 		return err
 	}
 
+	if sdsref.IsRef(secret) {
+		sdsCfg, err := sdsref.Parse(secret)
+		if err != nil {
+			return err
+		}
+		data.sds = sdsCfg
+		return nil
+	}
+
 	data.certChain = string(secret.Data["tls.crt"])
 	data.privateKey = string(secret.Data["tls.key"])
 	data.rootCA = string(secret.Data["ca.crt"])
@@ -104,6 +126,18 @@ func extractFromFiles(tlsFiles *kgateway.TLSFiles, data *tlsData) {
 }
 
 func buildCertificateContext(tlsData *tlsData, tlsContext *envoytlsv3.CommonTlsContext) error {
+	// An SDS-backed client certificate is fetched by the proxy at runtime. The
+	// reference may name only a validation context, in which case there is no
+	// client certificate and this is one-way TLS against an SDS trust bundle.
+	if tlsData.sds != nil {
+		if tlsData.sds.SecretName != "" {
+			tlsContext.TlsCertificateSdsSecretConfigs = []*envoytlsv3.SdsSecretConfig{
+				sdsref.BuildSecretConfig(tlsData.sds.SecretName, tlsData.sds.SocketPath),
+			}
+		}
+		return nil
+	}
+
 	// For mTLS, both the certificate chain and the private key are required.
 	// If neither is provided, we assume mTLS is not intended, so we can exit early.
 	if tlsData.certChain == "" && tlsData.privateKey == "" {
@@ -165,6 +199,36 @@ func buildValidationContext(tlsData *tlsData, tlsConfig *kgateway.TLS, tlsContex
 		}
 	}
 
+	// An SDS-backed trust bundle is fetched by the proxy at runtime. SAN matchers
+	// are still evaluated locally, so they combine with the SDS-provided context
+	// the same way the system CA path above combines them.
+	if tlsData.sds != nil {
+		if tlsData.sds.ValidationContextName == "" {
+			// Matches the inline path below: SAN verification is meaningless
+			// without a trust bundle to verify against.
+			if len(sanMatchers) > 0 {
+				return errors.New("a validationContextName must be provided in the SDS reference if verify_subject_alt_name is not empty")
+			}
+			return nil
+		}
+		sdsValidationContext := sdsref.BuildSecretConfig(tlsData.sds.ValidationContextName, tlsData.sds.SocketPath)
+		if len(sanMatchers) == 0 {
+			tlsContext.ValidationContextType = &envoytlsv3.CommonTlsContext_ValidationContextSdsSecretConfig{
+				ValidationContextSdsSecretConfig: sdsValidationContext,
+			}
+			return nil
+		}
+		tlsContext.ValidationContextType = &envoytlsv3.CommonTlsContext_CombinedValidationContext{
+			CombinedValidationContext: &envoytlsv3.CommonTlsContext_CombinedCertificateValidationContext{
+				DefaultValidationContext: &envoytlsv3.CertificateValidationContext{
+					MatchTypedSubjectAltNames: sanMatchers,
+				},
+				ValidationContextSdsSecretConfig: sdsValidationContext,
+			},
+		}
+		return nil
+	}
+
 	if tlsData.rootCA == "" {
 		// If no root CA and no SAN verification, no validation context needed
 		if len(sanMatchers) == 0 {
@@ -195,18 +259,21 @@ func buildValidationContext(tlsData *tlsData, tlsConfig *kgateway.TLS, tlsContex
 	return nil
 }
 
+// translateTLSConfig builds the upstream TLS context and reports the SDS server
+// sockets it referenced, which is empty for every source other than an SDS
+// reference Secret.
 func translateTLSConfig(
 	secretGetter SecretGetter,
 	tlsConfig *kgateway.TLS,
 	namespace string,
-) (*envoytlsv3.UpstreamTlsContext, error) {
+) (*envoytlsv3.UpstreamTlsContext, []string, error) {
 	tlsContext := &envoytlsv3.CommonTlsContext{
 		TlsParams: &envoytlsv3.TlsParameters{}, // default params
 	}
 
 	tlsParams, err := parseTLSParameters(tlsConfig.Parameters)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	tlsContext.TlsParams = tlsParams
 
@@ -214,11 +281,13 @@ func translateTLSConfig(
 		tlsContext.AlpnProtocols = tlsConfig.AlpnProtocols
 	}
 
+	var sdsSocketPaths []string
 	if tlsConfig.InsecureSkipVerify != nil && *tlsConfig.InsecureSkipVerify {
 		tlsContext.ValidationContextType = &envoytlsv3.CommonTlsContext_ValidationContext{}
 	} else {
-		if err := buildTLSContext(tlsConfig, secretGetter, namespace, tlsContext); err != nil {
-			return nil, err
+		sdsSocketPaths, err = buildTLSContext(tlsConfig, secretGetter, namespace, tlsContext)
+		if err != nil {
+			return nil, nil, err
 		}
 	}
 
@@ -226,7 +295,7 @@ func translateTLSConfig(
 		CommonTlsContext:   tlsContext,
 		Sni:                ptr.Deref(tlsConfig.Sni, ""),
 		AllowRenegotiation: ptr.Deref(tlsConfig.AllowRenegotiation, false),
-	}, nil
+	}, sdsSocketPaths, nil
 }
 
 func parseTLSParameters(tlsParameters *kgateway.TLSParameters) (*envoytlsv3.TlsParameters, error) {

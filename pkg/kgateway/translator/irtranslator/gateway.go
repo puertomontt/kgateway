@@ -13,10 +13,12 @@ import (
 	"google.golang.org/protobuf/types/known/wrapperspb"
 	istioslices "istio.io/istio/pkg/slices"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/sets"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	apisettings "github.com/kgateway-dev/kgateway/v2/api/settings"
 	"github.com/kgateway-dev/kgateway/v2/pkg/kgateway/query"
+	"github.com/kgateway-dev/kgateway/v2/pkg/kgateway/sdsref"
 	"github.com/kgateway-dev/kgateway/v2/pkg/kgateway/wellknown"
 	"github.com/kgateway-dev/kgateway/v2/pkg/logging"
 	sdk "github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk"
@@ -68,7 +70,53 @@ func (t *Translator) Translate(ctx context.Context, gw ir.GatewayIR, reporter sd
 		}
 	}
 
+	res.ExtraClusters = append(res.ExtraClusters, sdsTransportClusters(gw)...)
+
 	return res
+}
+
+// sdsTransportClusters returns the clusters Envoy needs in order to reach the SDS
+// servers that gw's listeners fetch certificates from. Each distinct socket path
+// yields one cluster, so listeners sharing an SDS server share its cluster.
+//
+// These are derived from the gateway's own references rather than from every SDS
+// reference Secret in the cluster, so a proxy only ever receives clusters for the
+// SDS servers it actually subscribes to.
+func sdsTransportClusters(gw ir.GatewayIR) []*envoyclusterv3.Cluster {
+	socketPaths := sets.New[string]()
+	for _, l := range gw.Listeners {
+		for _, fc := range l.HttpFilterChain {
+			collectSDSSocketPaths(fc.TLS, socketPaths)
+		}
+		for _, fc := range l.TcpFilterChain {
+			collectSDSSocketPaths(fc.TLS, socketPaths)
+		}
+	}
+	if socketPaths.Len() == 0 {
+		return nil
+	}
+
+	// Sorted so that an unchanged configuration always produces an identically
+	// ordered cluster list, which the snapshot hashing depends on.
+	clusters := make([]*envoyclusterv3.Cluster, 0, socketPaths.Len())
+	for _, path := range sets.List(socketPaths) {
+		clusters = append(clusters, sdsref.BuildCluster(path))
+	}
+	return clusters
+}
+
+func collectSDSSocketPaths(tls *ir.TLSConfig, out sets.Set[string]) {
+	if tls == nil {
+		return
+	}
+	for _, cert := range tls.Certificates {
+		if cert.SDS != nil {
+			out.Insert(cert.SDS.SocketPath)
+		}
+	}
+	if tls.ClientCertificateValidation != nil && tls.ClientCertificateValidation.SDS != nil {
+		out.Insert(tls.ClientCertificateValidation.SDS.SocketPath)
+	}
 }
 
 // findOriginalListenerName finds the original listener name for a given listener.

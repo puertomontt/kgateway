@@ -169,6 +169,7 @@ func NewCommonCollections(
 			},
 			Obj:  i,
 			Data: i.Data,
+			Type: i.Type,
 		}
 		return &res
 	}, krtOptions.ToOptions("secrets")...)

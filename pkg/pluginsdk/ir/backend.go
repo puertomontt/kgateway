@@ -12,6 +12,7 @@ import (
 	"istio.io/istio/pkg/kube/krt"
 	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/util/smallset"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -414,6 +415,13 @@ type Secret struct {
 
 	// +krtEqualsTodo evaluate secret data equality handling
 	Data map[string][]byte
+
+	// Type is the Secret's type field. It distinguishes a Secret carrying
+	// certificate material from one that merely references an SDS server (see
+	// pkg/kgateway/sdsref). Excluded from Equals because a type change is
+	// necessarily a change to the object, which versionEquals already detects.
+	// +noKrtEquals
+	Type corev1.SecretType
 }
 
 func (c Secret) ResourceName() string {

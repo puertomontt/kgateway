@@ -107,6 +107,10 @@ type TLSConfig struct {
 type ClientCertificateValidation struct {
 	// CACertificates contains the CA certificates used to validate client certificates
 	CACertificates [][]byte
+	// SDS points at a Secret Discovery Service server that supplies the trust
+	// bundle, instead of CACertificates being read from the cluster. The two are
+	// mutually exclusive.
+	SDS *SDSConfig
 	// RequireClientCertificate indicates whether client certificates are required
 	RequireClientCertificate bool
 	// AllowInsecureFallback allows the handshake to continue even when the
@@ -118,6 +122,40 @@ type TLSCertificate struct {
 	CA         []byte
 	PrivateKey []byte
 	CertChain  []byte
+	// SDS points at a Secret Discovery Service server that supplies the
+	// certificate, instead of the material being read from the cluster and
+	// inlined. When set, the inline fields above are empty; the two are
+	// mutually exclusive.
+	SDS *SDSConfig
+}
+
+// SDSConfig identifies certificate material served by a Secret Discovery
+// Service server reachable over a Unix domain socket in the proxy pod. It holds
+// no certificate material itself.
+type SDSConfig struct {
+	// SecretName is the SDS resource name Envoy requests for the role in which
+	// the reference was used: the certificate when referenced as a certificate,
+	// the trust bundle when referenced as a CA. For a SPIFFE/SPIRE agent this is
+	// typically a SPIFFE ID.
+	SecretName string
+	// ValidationContextName is the SDS resource name of the trust bundle, used
+	// only where a single reference must supply both a certificate and a trust
+	// bundle, as with BackendConfigPolicy's tls.secretRef. Empty elsewhere,
+	// where the CA is a reference of its own.
+	ValidationContextName string
+	// SocketPath is the filesystem path of the SDS server's Unix domain socket,
+	// as seen from inside the proxy pod.
+	SocketPath string
+}
+
+// Equals reports whether two SDS references are identical.
+func (s *SDSConfig) Equals(other *SDSConfig) bool {
+	if s == nil || other == nil {
+		return s == other
+	}
+	return s.SecretName == other.SecretName &&
+		s.ValidationContextName == other.ValidationContextName &&
+		s.SocketPath == other.SocketPath
 }
 
 type FilterChainCommon struct {

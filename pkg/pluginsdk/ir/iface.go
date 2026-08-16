@@ -281,6 +281,18 @@ type PolicyHashIR interface {
 	PolicyHash() uint64
 }
 
+// ExtraClustersIR can be implemented by PolicyIRs whose translated output refers
+// to an Envoy cluster that is not a backend, and so is not produced by backend
+// translation. An SDS transport cluster is the motivating case: a policy that
+// sources certificates from an SDS server produces a config source naming the
+// cluster that reaches it, and that cluster has to exist for the config to load.
+//
+// Implementations must return the same cluster for the same input, since the
+// same cluster may be declared by several policies and is deduplicated by name.
+type ExtraClustersIR interface {
+	ExtraClusters() []*envoyclusterv3.Cluster
+}
+
 type PolicyWrapper struct {
 	// A reference to the original policy object
 	ObjectSource `json:",inline"`

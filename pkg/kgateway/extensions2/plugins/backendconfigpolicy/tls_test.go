@@ -16,6 +16,7 @@ import (
 
 	"github.com/kgateway-dev/kgateway/v2/api/v1alpha1/kgateway"
 	eiutils "github.com/kgateway-dev/kgateway/v2/internal/envoyinit/pkg/utils"
+	"github.com/kgateway-dev/kgateway/v2/pkg/kgateway/sdsref"
 	"github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/ir"
 )
 
@@ -95,6 +96,27 @@ r8/mqGkEdNyd5BqGOFWoUi7kDqslOAl359Gd5ndxAoGAK3TVwhuLR9XoicDjmo6b
 35NY368cSzjvlBCisA91TbY=
 -----END PRIVATE KEY-----
 ` // must have this newline at the end
+
+const (
+	sdsSocket       = "/run/spire/sockets/agent.sock"
+	sdsCertResource = "spiffe://example.org/ns/default/sa/client"
+	sdsCAResource   = "spiffe://example.org"
+)
+
+// sdsRefSecret builds a Secret that points at an SDS server rather than carrying
+// certificate material.
+func sdsRefSecret(data map[string]string) *ir.Secret {
+	byteData := make(map[string][]byte, len(data))
+	for k, v := range data {
+		byteData[k] = []byte(v)
+	}
+	return &ir.Secret{
+		ObjectSource: ir.ObjectSource{Group: "", Kind: "Secret", Namespace: "default", Name: "sds-ref"},
+		Obj:          &corev1.Secret{},
+		Type:         sdsref.SecretType,
+		Data:         byteData,
+	}
+}
 
 func TestTranslateTLSConfig(t *testing.T) {
 	tests := []struct {
@@ -459,6 +481,133 @@ func TestTranslateTLSConfig(t *testing.T) {
 				Sni: "test.example.com",
 			},
 		},
+		{
+			name: "SDS reference supplying a client certificate only",
+			tlsConfig: &kgateway.TLS{
+				SecretRef: &corev1.LocalObjectReference{Name: "sds-ref"},
+				Sni:       new("test.example.com"),
+			},
+			secret: sdsRefSecret(map[string]string{
+				sdsref.SecretNameKey: sdsCertResource,
+				sdsref.URLKey:        "unix://" + sdsSocket,
+			}),
+			expected: &envoytlsv3.UpstreamTlsContext{
+				CommonTlsContext: &envoytlsv3.CommonTlsContext{
+					TlsCertificateSdsSecretConfigs: []*envoytlsv3.SdsSecretConfig{
+						sdsref.BuildSecretConfig(sdsCertResource, sdsSocket),
+					},
+				},
+				Sni: "test.example.com",
+			},
+		},
+		{
+			name: "SDS reference supplying a validation context only",
+			tlsConfig: &kgateway.TLS{
+				SecretRef: &corev1.LocalObjectReference{Name: "sds-ref"},
+			},
+			secret: sdsRefSecret(map[string]string{
+				sdsref.ValidationContextNameKey: sdsCAResource,
+				sdsref.URLKey:                   "unix://" + sdsSocket,
+			}),
+			expected: &envoytlsv3.UpstreamTlsContext{
+				CommonTlsContext: &envoytlsv3.CommonTlsContext{
+					ValidationContextType: &envoytlsv3.CommonTlsContext_ValidationContextSdsSecretConfig{
+						ValidationContextSdsSecretConfig: sdsref.BuildSecretConfig(sdsCAResource, sdsSocket),
+					},
+				},
+			},
+		},
+		{
+			name: "SDS reference supplying both, for mTLS",
+			tlsConfig: &kgateway.TLS{
+				SecretRef: &corev1.LocalObjectReference{Name: "sds-ref"},
+			},
+			secret: sdsRefSecret(map[string]string{
+				sdsref.SecretNameKey:            sdsCertResource,
+				sdsref.ValidationContextNameKey: sdsCAResource,
+				sdsref.URLKey:                   "unix://" + sdsSocket,
+			}),
+			expected: &envoytlsv3.UpstreamTlsContext{
+				CommonTlsContext: &envoytlsv3.CommonTlsContext{
+					TlsCertificateSdsSecretConfigs: []*envoytlsv3.SdsSecretConfig{
+						sdsref.BuildSecretConfig(sdsCertResource, sdsSocket),
+					},
+					ValidationContextType: &envoytlsv3.CommonTlsContext_ValidationContextSdsSecretConfig{
+						ValidationContextSdsSecretConfig: sdsref.BuildSecretConfig(sdsCAResource, sdsSocket),
+					},
+				},
+			},
+		},
+		{
+			name: "SDS reference with SAN matchers combines them with the SDS validation context",
+			tlsConfig: &kgateway.TLS{
+				SecretRef:             &corev1.LocalObjectReference{Name: "sds-ref"},
+				VerifySubjectAltNames: []string{"backend.example.com"},
+			},
+			secret: sdsRefSecret(map[string]string{
+				sdsref.ValidationContextNameKey: sdsCAResource,
+				sdsref.URLKey:                   "unix://" + sdsSocket,
+			}),
+			expected: &envoytlsv3.UpstreamTlsContext{
+				CommonTlsContext: &envoytlsv3.CommonTlsContext{
+					ValidationContextType: &envoytlsv3.CommonTlsContext_CombinedValidationContext{
+						CombinedValidationContext: &envoytlsv3.CommonTlsContext_CombinedCertificateValidationContext{
+							DefaultValidationContext: &envoytlsv3.CertificateValidationContext{
+								MatchTypedSubjectAltNames: []*envoytlsv3.SubjectAltNameMatcher{{
+									SanType: envoytlsv3.SubjectAltNameMatcher_DNS,
+									Matcher: &envoymatcher.StringMatcher{
+										MatchPattern: &envoymatcher.StringMatcher_Exact{Exact: "backend.example.com"},
+									},
+								}},
+							},
+							ValidationContextSdsSecretConfig: sdsref.BuildSecretConfig(sdsCAResource, sdsSocket),
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "SDS reference with simpleTLS drops the client certificate",
+			tlsConfig: &kgateway.TLS{
+				SecretRef: &corev1.LocalObjectReference{Name: "sds-ref"},
+				SimpleTLS: new(true),
+			},
+			secret: sdsRefSecret(map[string]string{
+				sdsref.SecretNameKey:            sdsCertResource,
+				sdsref.ValidationContextNameKey: sdsCAResource,
+				sdsref.URLKey:                   "unix://" + sdsSocket,
+			}),
+			expected: &envoytlsv3.UpstreamTlsContext{
+				CommonTlsContext: &envoytlsv3.CommonTlsContext{
+					ValidationContextType: &envoytlsv3.CommonTlsContext_ValidationContextSdsSecretConfig{
+						ValidationContextSdsSecretConfig: sdsref.BuildSecretConfig(sdsCAResource, sdsSocket),
+					},
+				},
+			},
+		},
+		{
+			name: "SDS reference with SAN matchers but no validation context is rejected",
+			tlsConfig: &kgateway.TLS{
+				SecretRef:             &corev1.LocalObjectReference{Name: "sds-ref"},
+				VerifySubjectAltNames: []string{"backend.example.com"},
+			},
+			secret: sdsRefSecret(map[string]string{
+				sdsref.SecretNameKey: sdsCertResource,
+				sdsref.URLKey:        "unix://" + sdsSocket,
+			}),
+			wantErr: true,
+		},
+		{
+			name: "malformed SDS reference is rejected",
+			tlsConfig: &kgateway.TLS{
+				SecretRef: &corev1.LocalObjectReference{Name: "sds-ref"},
+			},
+			secret: sdsRefSecret(map[string]string{
+				sdsref.SecretNameKey: sdsCertResource,
+				sdsref.URLKey:        "https://sds.example.com:8443",
+			}),
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -472,7 +621,7 @@ func TestTranslateTLSConfig(t *testing.T) {
 			}
 
 			// Call the function
-			result, err := translateTLSConfig(secretGetter, tt.tlsConfig, "default")
+			result, _, err := translateTLSConfig(secretGetter, tt.tlsConfig, "default")
 
 			// Check error
 			if tt.wantErr {

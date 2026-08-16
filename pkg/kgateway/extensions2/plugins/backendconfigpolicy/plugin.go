@@ -27,6 +27,7 @@ import (
 	"github.com/kgateway-dev/kgateway/v2/api/v1alpha1/kgateway"
 	"github.com/kgateway-dev/kgateway/v2/pkg/kgateway/endpoints"
 	"github.com/kgateway-dev/kgateway/v2/pkg/kgateway/extensions2/pluginutils"
+	"github.com/kgateway-dev/kgateway/v2/pkg/kgateway/sdsref"
 	"github.com/kgateway-dev/kgateway/v2/pkg/kgateway/utils"
 	"github.com/kgateway-dev/kgateway/v2/pkg/kgateway/wellknown"
 	"github.com/kgateway-dev/kgateway/v2/pkg/logging"
@@ -52,22 +53,45 @@ type BackendConfigPolicyIR struct {
 	http1ProtocolOptions          *envoycorev3.Http1ProtocolOptions
 	http2ProtocolOptions          *envoycorev3.Http2ProtocolOptions
 	tlsConfig                     *envoytlsv3.UpstreamTlsContext
-	loadBalancerConfig            *LoadBalancerConfigIR
-	healthCheck                   *envoycorev3.HealthCheck
-	outlierDetection              *envoyclusterv3.OutlierDetection
-	circuitBreakers               *envoyclusterv3.CircuitBreakers
-	dnsRefreshRate                *durationpb.Duration
-	dnsJitter                     *durationpb.Duration
-	respectDnsTtl                 *bool
-	upstreamProxyProtocol         *envoycorev3.ProxyProtocolConfig
+	// sdsSocketPaths holds the SDS server sockets tlsConfig fetches certificate
+	// material from, if any. Kept alongside tlsConfig because the transport
+	// clusters that reach those sockets have to be published to the proxy
+	// separately; see ExtraClusters.
+	sdsSocketPaths        []string
+	loadBalancerConfig    *LoadBalancerConfigIR
+	healthCheck           *envoycorev3.HealthCheck
+	outlierDetection      *envoyclusterv3.OutlierDetection
+	circuitBreakers       *envoyclusterv3.CircuitBreakers
+	dnsRefreshRate        *durationpb.Duration
+	dnsJitter             *durationpb.Duration
+	respectDnsTtl         *bool
+	upstreamProxyProtocol *envoycorev3.ProxyProtocolConfig
 }
 
 var logger = logging.New("plugin/backendconfigpolicy")
 
-var _ ir.PolicyIR = &BackendConfigPolicyIR{}
+var (
+	_ ir.PolicyIR        = &BackendConfigPolicyIR{}
+	_ ir.ExtraClustersIR = &BackendConfigPolicyIR{}
+)
 
 func (d *BackendConfigPolicyIR) CreationTime() time.Time {
 	return d.ct
+}
+
+// ExtraClusters returns the transport clusters Envoy needs in order to reach the
+// SDS servers this policy sources certificate material from. Policies pointing at
+// the same socket produce an identical cluster, which the caller deduplicates by
+// name.
+func (d *BackendConfigPolicyIR) ExtraClusters() []*envoyclusterv3.Cluster {
+	if len(d.sdsSocketPaths) == 0 {
+		return nil
+	}
+	clusters := make([]*envoyclusterv3.Cluster, 0, len(d.sdsSocketPaths))
+	for _, path := range d.sdsSocketPaths {
+		clusters = append(clusters, sdsref.BuildCluster(path))
+	}
+	return clusters
 }
 
 func (d *BackendConfigPolicyIR) Equals(other any) bool {
@@ -105,6 +129,10 @@ func (d *BackendConfigPolicyIR) Equals(other any) bool {
 	}
 
 	if !proto.Equal(d.tlsConfig, d2.tlsConfig) {
+		return false
+	}
+
+	if !slices.Equal(d.sdsSocketPaths, d2.sdsSocketPaths) {
 		return false
 	}
 
@@ -363,11 +391,12 @@ func translate(
 	}
 
 	if pol.Spec.TLS != nil {
-		tlsConfig, err := translateTLSConfig(NewDefaultSecretGetter(commoncol.Secrets, krtctx), pol.Spec.TLS, pol.Namespace)
+		tlsConfig, sdsSocketPaths, err := translateTLSConfig(NewDefaultSecretGetter(commoncol.Secrets, krtctx), pol.Spec.TLS, pol.Namespace)
 		if err != nil {
 			errs = append(errs, err)
 		}
 		ir.tlsConfig = tlsConfig
+		ir.sdsSocketPaths = sdsSocketPaths
 	}
 
 	if pol.Spec.LoadBalancer != nil {
