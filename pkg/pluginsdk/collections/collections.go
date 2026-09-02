@@ -246,8 +246,8 @@ func NewCommonCollections(
 	return &CommonCollections{
 		Client:                                client,
 		KrtOpts:                               krtOptions,
-		Secrets:                               krtcollections.NewSecretIndex(secrets, refgrants),
-		ConfigMaps:                            krtcollections.NewConfigMapIndex(cfgmaps, refgrants),
+		Secrets:                               krtcollections.NewSecretIndex(secrets, refgrants, settings.SecretDiscoveryMode),
+		ConfigMaps:                            krtcollections.NewConfigMapIndex(cfgmaps, refgrants, settings.ConfigMapDiscoveryMode),
 		LocalityPods:                          localityPods,
 		WrappedPods:                           wrappedPods,
 		RefGrants:                             refgrants,

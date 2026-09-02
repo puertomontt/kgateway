@@ -3,7 +3,6 @@ package gateway
 import (
 	"context"
 	"errors"
-	"fmt"
 
 	"istio.io/istio/pkg/kube/krt"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -126,15 +125,9 @@ func reportGatewayBackendClientCertificateError(err error, gatewayReporter repor
 		reason = gwv1.GatewayReasonRefNotPermitted
 	}
 
-	message := err.Error()
-	var notFoundErr *krtcollections.NotFoundError
-	if errors.As(err, &notFoundErr) {
-		resourceType := notFoundErr.NotFoundObj.Kind
-		if resourceType == "" {
-			resourceType = "Resource"
-		}
-		message = fmt.Sprintf(listener.ResourceNotFoundMessageTemplate, resourceType, notFoundErr.NotFoundObj.Namespace, notFoundErr.NotFoundObj.Name)
-	}
+	// Renders a not-found reference the same way the listener conditions do, while keeping
+	// the context any wrapper added and every leaf of a joined error.
+	message := listener.FormatRefErrorMessage(err)
 
 	gatewayReporter.SetCondition(reports.GatewayCondition{
 		Type:    gwv1.GatewayConditionResolvedRefs,

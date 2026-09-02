@@ -1008,7 +1008,7 @@ func newSecretIndexForTest(t *testing.T, secrets ...*corev1.Secret) *krtcollecti
 				Data: i.Data,
 			}
 		}),
-	}, refgrants)
+	}, refgrants, apisettings.DiscoveryAll)
 	secretCol.WaitUntilSynced(nil)
 	refGrantCol.WaitUntilSynced(nil)
 	for !secretIndex.HasSynced() {

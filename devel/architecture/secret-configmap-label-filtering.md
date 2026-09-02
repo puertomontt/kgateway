@@ -39,6 +39,20 @@ carry the label. A reference to an object that does not is indistinguishable fro
 reference to an object that does not exist, and is reported the same way — for a TLS listener
 certificate, for example, `ResolvedRefs: False` with reason `InvalidCertificateRef`.
 
+Because kgateway cannot tell the two apart, in `LABELED` mode the not-found message says so
+rather than asserting the object is absent:
+
+```
+Secret default/example-cert not found. Secrets are discovered by label
+(secretDiscoveryMode=LABELED); ensure it is labeled kgateway.dev/watch="true".
+```
+
+The sentence comes from `NotFoundError.Hint`, set by `SecretIndex` and `ConfigMapIndex` — the
+one place every reference resolves — so it reaches every status that reports a missing Secret
+or ConfigMap. In `ALL` mode the hint is empty and the message is unchanged. Only the core
+`Secret` kind carries it; a Secret kind contributed by a plugin has its own watch, which this
+setting does not filter.
+
 ## Why a fixed label rather than a configurable selector
 
 The label is pushed to the API server as the informer's `labelSelector`, so the objects are
@@ -102,4 +116,11 @@ and `CommonCollections.ConfigMaps`, or pass
   Helm upgrade does anyway.
 - There is no cluster-wide way to find out which objects kgateway *would* need labeled before
   switching a live install to `LABELED`; references that lose their target surface as status
-  conditions after the fact.
+  conditions after the fact, carrying the hint above.
+- Two lookups build their own not-found error instead of going through the indexes, so they
+  report a plain "not found" with no hint: the JWT `localJWKS.configMapRef` in the
+  trafficpolicy plugin, and the CA `configMapRef` in the backendtlspolicy plugin (which uses
+  its own `ErrConfigMapNotFound` sentinel). Both read `CommonCollections.ConfigMaps` through
+  `.Collection()`, bypassing `GetConfigMap`.
+- A Secret referenced by label rather than by name (`apiKeyAuth.secretSelector`) matches
+  nothing instead of failing, so there is no not-found error to attach a hint to.

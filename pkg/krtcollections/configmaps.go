@@ -6,16 +6,30 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 
+	apisettings "github.com/kgateway-dev/kgateway/v2/api/settings"
 	"github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/ir"
 )
 
 type ConfigMapIndex struct {
 	configmaps krt.Collection[*corev1.ConfigMap]
 	refgrants  *RefGrantIndex
+
+	// notFoundHint is attached to the NotFoundError, to say that an unlabeled ConfigMap
+	// looks missing when discovery is by label. Computed once here rather than per lookup.
+	// Empty unless ConfigMapDiscoveryMode is LABELED.
+	notFoundHint string
 }
 
-func NewConfigMapIndex(configmaps krt.Collection[*corev1.ConfigMap], refgrants *RefGrantIndex) *ConfigMapIndex {
-	return &ConfigMapIndex{configmaps: configmaps, refgrants: refgrants}
+func NewConfigMapIndex(
+	configmaps krt.Collection[*corev1.ConfigMap],
+	refgrants *RefGrantIndex,
+	discoveryMode apisettings.DiscoveryMode,
+) *ConfigMapIndex {
+	return &ConfigMapIndex{
+		configmaps:   configmaps,
+		refgrants:    refgrants,
+		notFoundHint: labeledDiscoveryHint(discoveryMode, "ConfigMaps", "configMapDiscoveryMode"),
+	}
 }
 
 func (c *ConfigMapIndex) HasSynced() bool {
@@ -55,7 +69,7 @@ func (c *ConfigMapIndex) GetConfigMap(kctx krt.HandlerContext, from From, config
 	}
 	cmPtr := krt.FetchOne(kctx, c.configmaps, krt.FilterObjectName(nn))
 	if cmPtr == nil {
-		return nil, &NotFoundError{NotFoundObj: to}
+		return nil, &NotFoundError{NotFoundObj: to, Hint: c.notFoundHint}
 	}
 
 	return *cmPtr, nil

@@ -1350,37 +1350,38 @@ func reportTLSConfigError(err error, listenerReporter reports.ListenerReporter, 
 	case errors.Is(err, sslutils.ErrMissingCaCertificateRefGrant):
 		reason = gwv1.ListenerReasonRefNotPermitted
 		acceptedReason = sslutils.ListenerReasonNoValidCACertificate
-		message = err.Error()
+		message = FormatRefErrorMessage(err)
 	case errors.Is(err, sslutils.ErrInvalidTlsSecret):
-		message = err.Error()
+		message = FormatRefErrorMessage(err)
 	case errors.Is(err, sslutils.ErrVerifySubjectAltNamesRequiresCA):
 		// verify-subject-alt-names requires CA is a TLS configuration issue,
 		// not a certificate reference problem — the secret refs resolved fine.
 		resolvedRefsOK = true
-		message = err.Error()
+		message = FormatRefErrorMessage(err)
 	case errors.Is(err, sslutils.ErrInvalidCACertificateRef):
 		reason = sslutils.ListenerReasonInvalidCACertificateRef
 		acceptedReason = sslutils.ListenerReasonNoValidCACertificate
-		message = err.Error()
+		message = FormatRefErrorMessage(err)
 	case errors.Is(err, sslutils.ErrInvalidCACertificateKind):
 		reason = sslutils.ListenerReasonInvalidCACertificateKind
 		acceptedReason = sslutils.ListenerReasonNoValidCACertificate
-		message = err.Error()
+		message = FormatRefErrorMessage(err)
 	case errors.Is(err, sslutils.ErrUnknownTLSExtensionOption):
 		// Unknown TLS extension options are not a certificate reference problem;
 		// the cert refs resolved fine. Per the Gateway API spec, this is an
 		// Invalid condition on Programmed/Accepted, not a ResolvedRefs issue.
 		resolvedRefsOK = true
-		message = err.Error()
+		message = FormatRefErrorMessage(err)
 	}
 
+	// A NotFoundError matches none of the sentinels above, so it reaches here with the
+	// generic message and is rendered now. Rendering the whole error keeps the context any
+	// wrapper added — including the hint that says an unlabeled object looks missing under
+	// labeled discovery — and keeps the other leaves of a joined error, instead of
+	// collapsing a listener with several bad certificateRefs to the not-found one.
 	var notFoundErr *krtcollections.NotFoundError
 	if errors.As(err, &notFoundErr) {
-		resourceType := notFoundErr.NotFoundObj.Kind
-		if resourceType == "" {
-			resourceType = "Resource"
-		}
-		message = fmt.Sprintf(ResourceNotFoundMessageTemplate, resourceType, notFoundErr.NotFoundObj.Namespace, notFoundErr.NotFoundObj.Name)
+		message = FormatRefErrorMessage(err)
 	}
 
 	// When resolvedRefsOK is true, do not set a ResolvedRefs condition at all

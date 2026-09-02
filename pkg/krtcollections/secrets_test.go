@@ -163,7 +163,7 @@ func TestSecretIndex_GetSecretWithoutRefGrant(t *testing.T) {
 					}
 				}),
 			}
-			secretIndex := NewSecretIndex(secretsCol, refgrants)
+			secretIndex := NewSecretIndex(secretsCol, refgrants, apisettings.DiscoveryAll)
 
 			// Wait for collections to sync
 			secretCol.WaitUntilSynced(nil)

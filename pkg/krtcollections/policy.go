@@ -45,10 +45,32 @@ var (
 type NotFoundError struct {
 	// I call this `NotFound` so its easy to find in krt dump.
 	NotFoundObj ir.ObjectSource
+
+	// Hint is an optional sentence explaining why the object may be missing, appended to
+	// the message. It is set when the kind is discovered by label, where an object that
+	// exists but is not labeled is indistinguishable from one that does not exist at all,
+	// and an unqualified "not found" would point at the wrong diagnosis.
+	Hint string
 }
 
 func (n *NotFoundError) Error() string {
-	return fmt.Sprintf("%s %s/%s not found", n.NotFoundObj.Kind, n.NotFoundObj.Namespace, n.NotFoundObj.Name)
+	msg := fmt.Sprintf("%s %s/%s not found", n.NotFoundObj.Kind, n.NotFoundObj.Namespace, n.NotFoundObj.Name)
+	if n.Hint != "" {
+		msg += ". " + n.Hint
+	}
+	return msg
+}
+
+// labeledDiscoveryHint returns the NotFoundError.Hint to use for a kind whose discovery mode
+// is mode. It returns "" for every mode other than LABELED, so the default (ALL) message is
+// unchanged. kindPlural names the kind as it reads in a sentence ("Secrets"), and settingName
+// is the Helm value that selected the mode.
+func labeledDiscoveryHint(mode apisettings.DiscoveryMode, kindPlural, settingName string) string {
+	if mode != apisettings.DiscoveryLabeled {
+		return ""
+	}
+	return fmt.Sprintf("%s are discovered by label (%s=%s); ensure it is labeled %s=%q.",
+		kindPlural, settingName, apisettings.DiscoveryLabeled, wellknown.WatchLabel, wellknown.WatchLabelValue)
 }
 
 type BackendPortNotAllowedError struct {

@@ -1370,7 +1370,7 @@ func newQueries(t test.Failer, initObjs ...client.Object) query.GatewayQueries {
 			return &res
 		}),
 	}
-	secrets := krtcollections.NewSecretIndex(secretsCol, refgrants)
+	secrets := krtcollections.NewSecretIndex(secretsCol, refgrants, apisettings.DiscoveryAll)
 	nsCol := krtcollections.NewNamespaceCollectionFromCol(context.Background(), krttest.GetMockCollection[*corev1.Namespace](mock), krtutil.KrtOptions{})
 
 	commonCols := &collections.CommonCollections{

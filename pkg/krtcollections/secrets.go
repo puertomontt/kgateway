@@ -7,6 +7,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 
+	apisettings "github.com/kgateway-dev/kgateway/v2/api/settings"
 	"github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/ir"
 )
 
@@ -18,11 +19,28 @@ type From struct {
 type SecretIndex struct {
 	secrets   map[schema.GroupKind]krt.Collection[ir.Secret]
 	refgrants *RefGrantIndex
+
+	// notFoundHint is attached to the NotFoundError for a core Secret, to say that an
+	// unlabeled Secret looks missing when discovery is by label. Computed once here rather
+	// than per lookup. Empty unless SecretDiscoveryMode is LABELED.
+	notFoundHint string
 }
 
-func NewSecretIndex(secrets map[schema.GroupKind]krt.Collection[ir.Secret], refgrants *RefGrantIndex) *SecretIndex {
-	return &SecretIndex{secrets: secrets, refgrants: refgrants}
+func NewSecretIndex(
+	secrets map[schema.GroupKind]krt.Collection[ir.Secret],
+	refgrants *RefGrantIndex,
+	discoveryMode apisettings.DiscoveryMode,
+) *SecretIndex {
+	return &SecretIndex{
+		secrets:      secrets,
+		refgrants:    refgrants,
+		notFoundHint: labeledDiscoveryHint(discoveryMode, "Secrets", "secretDiscoveryMode"),
+	}
 }
+
+// coreSecretGK is the only Secret kind that SecretDiscoveryMode filters; a kind contributed
+// by a plugin has its own watch and must not be blamed on the setting.
+var coreSecretGK = schema.GroupKind{Group: "", Kind: "Secret"}
 
 func (s *SecretIndex) HasSynced() bool {
 	if !s.refgrants.HasSynced() {
@@ -56,7 +74,8 @@ func (s *SecretIndex) GetSecret(kctx krt.HandlerContext, from From, secretRef gw
 		Namespace: toNs,
 		Name:      string(secretRef.Name),
 	}
-	col := s.secrets[schema.GroupKind{Group: secretGroup, Kind: secretKind}]
+	secretGK := schema.GroupKind{Group: secretGroup, Kind: secretKind}
+	col := s.secrets[secretGK]
 	if col == nil {
 		// should never happen
 		return nil, fmt.Errorf("internal error looking up secret %s", to.NamespacedName())
@@ -67,7 +86,11 @@ func (s *SecretIndex) GetSecret(kctx krt.HandlerContext, from From, secretRef gw
 	}
 	secret := krt.FetchOne(kctx, col, krt.FilterKey(to.ResourceName()))
 	if secret == nil {
-		return nil, &NotFoundError{NotFoundObj: to}
+		notFound := &NotFoundError{NotFoundObj: to}
+		if secretGK == coreSecretGK {
+			notFound.Hint = s.notFoundHint
+		}
+		return nil, notFound
 	}
 	return secret, nil
 }

@@ -218,6 +218,21 @@ func TestBasic(t *testing.T) {
 		})
 	})
 
+	t.Run("https gateway with invalid certificate ref and labeled secret discovery", func(t *testing.T) {
+		// With labeled discovery an unlabeled Secret is indistinguishable from a missing one,
+		// so the listener condition has to say the label may be what is missing.
+		test(t, translatorTestCase{
+			inputFiles: []string{"https-routing/invalid-cert.yaml"},
+			outputFile: "https-invalid-cert-labeled-discovery-proxy.yaml",
+			gwNN: types.NamespacedName{
+				Namespace: "default",
+				Name:      "example-gateway",
+			},
+		}, func(s *apisettings.Settings) {
+			s.SecretDiscoveryMode = apisettings.DiscoveryLabeled
+		})
+	})
+
 	t.Run("http gateway with multiple listeners on the same port", func(t *testing.T) {
 		test(t, translatorTestCase{
 			inputFiles: []string{"multiple-listeners-http-routing"},

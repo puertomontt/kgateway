@@ -185,7 +185,7 @@ func TestConvertHeaderFilter(t *testing.T) {
 			}
 		}),
 	}
-	secretIndex := krtcollections.NewSecretIndex(secretsCol, refgrants)
+	secretIndex := krtcollections.NewSecretIndex(secretsCol, refgrants, apisettings.DiscoveryAll)
 
 	// Wait for collections to sync
 	secretCol.WaitUntilSynced(nil)
