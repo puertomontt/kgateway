@@ -422,6 +422,22 @@ type ec2EndpointsCollection struct {
 	DiscoveryStatus krt.Collection[ir.BackendObjectStatus]
 }
 
+// Ec2EndpointsCollection is EC2 endpoint discovery over a collection of backends.
+// Exported, with NewEc2EndpointsCollection, so a plugin owning a kind that embeds
+// kgateway.BackendSpec gets discovery for the embedded aws.ec2 field. Discovery
+// reads the spec through SpecOf and the IR through IrOf, so it is kind-agnostic; a
+// caller wanting one collection over several kinds passes a joined collection.
+type Ec2EndpointsCollection = ec2EndpointsCollection
+
+// NewEc2EndpointsCollection starts EC2 endpoint discovery over backends.
+func NewEc2EndpointsCollection(
+	ctx context.Context,
+	commoncol *plugincollections.CommonCollections,
+	backends krt.Collection[ir.BackendObjectIR],
+) *Ec2EndpointsCollection {
+	return newEc2EndpointsCollection(ctx, commoncol, backends)
+}
+
 func newEc2EndpointsCollection(
 	ctx context.Context,
 	commoncol *plugincollections.CommonCollections,
@@ -785,15 +801,15 @@ func (c *ec2EndpointsCollection) endpointsForBackend(backend ir.BackendObjectIR,
 // synchronously (they never become pollable); pollable backends report the outcome of
 // the most recent poll, which is recomputed whenever the discovery state changes.
 func (c *ec2EndpointsCollection) discoveryStatusForBackend(kctx krt.HandlerContext, backend ir.BackendObjectIR) *ir.BackendObjectStatus {
-	obj, ok := backend.Obj.(*kgateway.Backend)
-	if !ok || obj.Spec.Aws == nil || obj.Spec.Aws.Ec2 == nil {
+	spec := SpecOf(backend.Obj)
+	if spec == nil || spec.Aws == nil || spec.Aws.Ec2 == nil {
 		return nil
 	}
 
 	// A Backend configured for secret-based auth whose secret cannot be resolved is
 	// filtered out before the discovery loop builds a pollable config. Surface a
 	// CredentialError here so the failure is never silent (FR-8, NFR-2).
-	if message, unresolved := ec2UnresolvedSecretCredential(backend, obj); unresolved {
+	if message, unresolved := ec2UnresolvedSecretCredential(backend, spec); unresolved {
 		// This backend never enters the poll loop, so reflect its error state in the
 		// metrics here; otherwise an unresolvable secret (the most common
 		// misconfiguration) would be invisible to error_state alerting.
@@ -829,15 +845,15 @@ func (c *ec2EndpointsCollection) discoveryStatusForBackend(kctx krt.HandlerConte
 
 // ec2UnresolvedSecretCredential reports whether an EC2 backend is configured for
 // secret-based auth but its secret could not be resolved, returning an operator-facing
-// message that never includes secret values. obj must be the *kgateway.Backend already
-// asserted from backend.Obj by the caller.
-func ec2UnresolvedSecretCredential(backend ir.BackendObjectIR, obj *kgateway.Backend) (string, bool) {
-	auth := obj.Spec.Aws.Auth
+// message that never includes secret values. spec must be the kgateway.BackendSpec
+// already resolved from backend.Obj by the caller, with a non-nil aws.ec2.
+func ec2UnresolvedSecretCredential(backend ir.BackendObjectIR, spec *kgateway.BackendSpec) (string, bool) {
+	auth := spec.Aws.Auth
 	if auth == nil || auth.Type != kgateway.AwsAuthTypeSecret {
 		return "", false
 	}
 	// The secret is considered resolved iff it made it onto the backend IR.
-	if beIr, ok := backend.ObjIr.(*backendIr); ok &&
+	if beIr := IrOf(backend.ObjIr); beIr != nil &&
 		beIr.awsIr != nil && beIr.awsIr.ec2Ir != nil && beIr.awsIr.ec2Ir.secret != nil {
 		return "", false
 	}
@@ -845,7 +861,7 @@ func ec2UnresolvedSecretCredential(backend ir.BackendObjectIR, obj *kgateway.Bac
 	if auth.SecretRef != nil {
 		name = auth.SecretRef.Name
 	}
-	return fmt.Sprintf("aws auth secret %q in namespace %q could not be resolved", name, obj.GetNamespace()), true
+	return fmt.Sprintf("aws auth secret %q in namespace %q could not be resolved", name, backend.GetObjectSource().Namespace), true
 }
 
 // ec2DiscoveryStatusUpdate wraps a discovery status as a BackendObjectStatus carrying
@@ -863,12 +879,12 @@ func ec2DiscoveryStatusUpdate(backend ir.BackendObjectIR, status ec2DiscoverySta
 }
 
 func ec2ConfigFromBackend(backend ir.BackendObjectIR) *ec2BackendConfig {
-	obj, ok := backend.Obj.(*kgateway.Backend)
-	if !ok || obj.Spec.Aws == nil || obj.Spec.Aws.Ec2 == nil {
+	spec := SpecOf(backend.Obj)
+	if spec == nil || spec.Aws == nil || spec.Aws.Ec2 == nil {
 		return nil
 	}
-	backendIR, ok := backend.ObjIr.(*backendIr)
-	if !ok || backendIR.awsIr == nil || backendIR.awsIr.ec2Ir == nil {
+	backendIR := IrOf(backend.ObjIr)
+	if backendIR == nil || backendIR.awsIr == nil || backendIR.awsIr.ec2Ir == nil {
 		return nil
 	}
 	// An EC2 backend with a secret-auth credential that could not be resolved never

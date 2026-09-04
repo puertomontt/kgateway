@@ -48,7 +48,7 @@ func TestBuildPriorityGroupsIr(t *testing.T) {
 			kgateway.Host{Host: "9.10.11.13", Port: gwv1.PortNumber(8000)}),
 	})
 
-	pgIr, errs := buildPriorityGroupsIr(krt.TestingDummyContext{}, col,
+	pgIr, errs := buildPriorityGroupsIrForTest(krt.TestingDummyContext{}, col,
 		priorityGroupsBackend(group("primary"), group("failover-a", "failover-b")))
 
 	g.Expect(errs).To(gomega.BeEmpty(), "all refs resolve to static backends")
@@ -79,7 +79,7 @@ func TestBuildPriorityGroupsIrDnsHostname(t *testing.T) {
 		staticBackend("failover", kgateway.Host{Host: "example.com", Port: gwv1.PortNumber(80)}),
 	})
 
-	pgIr, errs := buildPriorityGroupsIr(krt.TestingDummyContext{}, col,
+	pgIr, errs := buildPriorityGroupsIrForTest(krt.TestingDummyContext{}, col,
 		priorityGroupsBackend(group("primary"), group("failover")))
 
 	g.Expect(errs).To(gomega.BeEmpty())
@@ -100,7 +100,7 @@ func TestBuildPriorityGroupsIrErrors(t *testing.T) {
 		awsBackend,
 	})
 
-	_, errs := buildPriorityGroupsIr(krt.TestingDummyContext{}, col,
+	_, errs := buildPriorityGroupsIrForTest(krt.TestingDummyContext{}, col,
 		priorityGroupsBackend(group("primary"), group("lambda"), group("missing")))
 
 	g.Expect(errs).To(gomega.HaveLen(2))
@@ -116,7 +116,7 @@ func TestProcessPriorityGroups(t *testing.T) {
 	col := krt.NewStaticCollection(nil, []*kgateway.Backend{
 		staticBackend("primary", kgateway.Host{Host: "1.2.3.4", Port: gwv1.PortNumber(8080)}),
 	})
-	pgIr, errs := buildPriorityGroupsIr(krt.TestingDummyContext{}, col,
+	pgIr, errs := buildPriorityGroupsIrForTest(krt.TestingDummyContext{}, col,
 		priorityGroupsBackend(group("primary")))
 	g.Expect(errs).To(gomega.BeEmpty())
 

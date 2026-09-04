@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"errors"
 	"fmt"
 
 	envoyclusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/kgateway-dev/kgateway/v2/api/v1alpha1/kgateway"
 	"github.com/kgateway-dev/kgateway/v2/pkg/kgateway/utils"
+	"github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/ir"
 	"github.com/kgateway-dev/kgateway/v2/pkg/utils/cmputils"
 )
 
@@ -46,20 +48,27 @@ func (u *PriorityGroupsIr) Equals(other any) bool {
 func buildPriorityGroupsIr(
 	krtctx krt.HandlerContext,
 	col krt.Collection[*kgateway.Backend],
-	be *kgateway.Backend,
+	src ir.ObjectSource,
+	groups []kgateway.PriorityGroup,
 ) (*PriorityGroupsIr, []error) {
 	var errs []error
 	needsDNS := false
 	loadAssignment := &envoyendpointv3.ClusterLoadAssignment{}
 
-	for gi, group := range be.Spec.PriorityGroups {
+	if col == nil {
+		// A caller that does not expose priorityGroups still reaches this arm if its
+		// spec sets the field; say so rather than reporting every ref as not found.
+		return nil, []error{errors.New("priority groups are not supported by this backend kind")}
+	}
+
+	for gi, group := range groups {
 		locality := &envoyendpointv3.LocalityLbEndpoints{
 			Priority: uint32(gi), //nolint:gosec // G115: group index is bounded by the CRD list length, always safe
 		}
 		for _, ref := range group.BackendRefs {
-			refBe := krt.FetchOne(krtctx, col, krt.FilterKey(be.GetNamespace()+"/"+ref.Name))
+			refBe := krt.FetchOne(krtctx, col, krt.FilterKey(src.Namespace+"/"+ref.Name))
 			if refBe == nil {
-				errs = append(errs, fmt.Errorf("priority group %d: backend %q not found in namespace %q", gi, ref.Name, be.GetNamespace()))
+				errs = append(errs, fmt.Errorf("priority group %d: backend %q not found in namespace %q", gi, ref.Name, src.Namespace))
 				continue
 			}
 			if (*refBe).Spec.Static == nil {

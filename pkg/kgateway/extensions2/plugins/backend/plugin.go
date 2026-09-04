@@ -3,22 +3,15 @@ package backend
 import (
 	"context"
 	"errors"
-	"fmt"
 
 	envoyclusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
-	envoycorev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	envoyroutev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
-	envoytlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
-	envoywellknown "github.com/envoyproxy/go-control-plane/pkg/wellknown"
 	"google.golang.org/protobuf/types/known/wrapperspb"
-	"istio.io/istio/pkg/kube/kclient"
 	"istio.io/istio/pkg/kube/krt"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/kgateway-dev/kgateway/v2/api/v1alpha1/kgateway"
-	"github.com/kgateway-dev/kgateway/v2/pkg/kgateway/utils"
 	"github.com/kgateway-dev/kgateway/v2/pkg/kgateway/wellknown"
-	"github.com/kgateway-dev/kgateway/v2/pkg/krtcollections"
 	"github.com/kgateway-dev/kgateway/v2/pkg/logging"
 	sdk "github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk"
 	"github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/collections"
@@ -35,8 +28,12 @@ const (
 
 var errAwsEc2DiscoveryDisabled = errors.New("aws ec2 discovery is disabled by controller settings")
 
-// backendIr is the internal representation of a backend.
-type backendIr struct {
+// BackendIr is the intermediate representation of a kgateway.BackendSpec.
+//
+// It is exported so that a plugin owning a kind that embeds kgateway.BackendSpec can
+// hold one and hand it back to ProcessForEnvoy; its fields stay unexported because
+// everything a caller needs to do with it is done by this package. See constructor.go.
+type BackendIr struct {
 	awsIr            *AwsIr
 	staticIr         *StaticIr
 	dfpIr            *DfpIr
@@ -45,8 +42,17 @@ type backendIr struct {
 	errors           []error
 }
 
-func (u *backendIr) Equals(other any) bool {
-	otherBackend, ok := other.(*backendIr)
+// Errors returns the translation errors collected while constructing the IR. A
+// caller reporting status for its own kind reports these as its own.
+func (u *BackendIr) Errors() []error {
+	if u == nil {
+		return nil
+	}
+	return u.errors
+}
+
+func (u *BackendIr) Equals(other any) bool {
+	otherBackend, ok := other.(*BackendIr)
 	if !ok {
 		return false
 	}
@@ -93,30 +99,24 @@ func backendIRErrorEqual(a, b error) bool {
 }
 
 func NewPlugin(ctx context.Context, commoncol *collections.CommonCollections) sdk.Plugin {
-	cli := kclient.NewFilteredDelayed[*kgateway.Backend](
-		commoncol.Client,
-		wellknown.BackendGVR,
-		kclient.Filter{ObjectFilter: commoncol.Client.ObjectFilter()},
-	)
-
-	col := krt.WrapClient(cli, commoncol.KrtOpts.ToOptions("Backends")...)
+	col := NewBackendCollection(commoncol, "Backends")
+	constructor := NewConstructor(commoncol, col)
 
 	gk := wellknown.BackendGVK.GroupKind()
-	translateFn := buildTranslateFunc(col, commoncol.Secrets, commoncol.Settings.EnableAwsEc2Discovery)
 	bcol := krt.NewCollection(col, func(krtctx krt.HandlerContext, i *kgateway.Backend) *ir.BackendObjectIR {
-		backendIR := translateFn(krtctx, i)
-		if len(backendIR.errors) > 0 {
-			logger.Error("failed to translate backend", "backend", i.GetName(), "error", errors.Join(backendIR.errors...))
-		}
 		objSrc := ir.ObjectSource{
 			Kind:      gk.Kind,
 			Group:     gk.Group,
 			Namespace: i.GetNamespace(),
 			Name:      i.GetName(),
 		}
+		backendIR := constructor.ConstructIR(krtctx, objSrc, &i.Spec)
+		if len(backendIR.errors) > 0 {
+			logger.Error("failed to translate backend", "backend", i.GetName(), "error", errors.Join(backendIR.errors...))
+		}
 		backend := ir.NewBackendObjectIR(objSrc, 0, "", ExtensionName)
-		backend.CanonicalHostname = hostname(i)
-		backend.AppProtocol = parseAppProtocol(i)
+		backend.CanonicalHostname = CanonicalHostnameFor(&i.Spec)
+		backend.AppProtocol = AppProtocolFor(&i.Spec)
 		backend.Obj = i
 		backend.ObjIr = backendIR
 		backend.Errors = backendIR.errors
@@ -125,12 +125,12 @@ func NewPlugin(ctx context.Context, commoncol *collections.CommonCollections) sd
 		ir.ParseObjectAnnotations(&backend, i)
 		return &backend
 	})
-	ec2Endpoints := newEc2EndpointsCollection(ctx, commoncol, bcol)
+	ec2Endpoints := NewEc2EndpointsCollection(ctx, commoncol, bcol)
 	return sdk.Plugin{
 		ContributesBackends: map[schema.GroupKind]sdk.BackendPlugin{
 			gk: {
 				BackendInit: ir.BackendInit{
-					InitEnvoyBackend: processBackendForEnvoy,
+					InitEnvoyBackend: InitEnvoyBackend,
 				},
 				RawBackends:     col,
 				Backends:        bcol,
@@ -141,212 +141,30 @@ func NewPlugin(ctx context.Context, commoncol *collections.CommonCollections) sd
 		ContributesPolicies: map[schema.GroupKind]sdk.PolicyPlugin{
 			wellknown.BackendGVK.GroupKind(): {
 				Name:                      "backend",
-				NewGatewayTranslationPass: newPlug,
+				NewGatewayTranslationPass: NewTranslationPass,
 			},
 		},
 		ExtraHasSynced: ec2Endpoints.HasSynced,
 	}
 }
 
-// buildTranslateFunc builds a function that translates a Backend to a backendIr that
-// the plugin can use to build the envoy config.
-func buildTranslateFunc(
-	col krt.Collection[*kgateway.Backend],
-	secrets *krtcollections.SecretIndex,
-	enableAwsEc2Discovery bool,
-) func(krtctx krt.HandlerContext, i *kgateway.Backend) *backendIr {
-	return func(krtctx krt.HandlerContext, i *kgateway.Backend) *backendIr {
-		var beIr backendIr
-		switch {
-		case len(i.Spec.PriorityGroups) > 0:
-			pgIr, errs := buildPriorityGroupsIr(krtctx, col, i)
-			beIr.priorityGroupsIr = pgIr
-			beIr.errors = append(beIr.errors, errs...)
-		case i.Spec.Static != nil:
-			staticIr, err := buildStaticIr(i.Spec.Static)
-			if err != nil {
-				beIr.errors = append(beIr.errors, err)
-			}
-			beIr.staticIr = staticIr
-		case i.Spec.DynamicForwardProxy != nil:
-			dfpIr, err := buildDfpIr(i.Spec.DynamicForwardProxy)
-			if err != nil {
-				beIr.errors = append(beIr.errors, err)
-			}
-			beIr.dfpIr = dfpIr
-		case i.Spec.Aws != nil:
-			switch {
-			case i.Spec.Aws.Lambda != nil:
-				region := defaultAwsRegion(i.Spec.Aws.Region)
-				invokeMode := getLambdaInvocationMode(i.Spec.Aws)
-
-				secret, err := loadAWSSecret(krtctx, secrets, i)
-				if err != nil {
-					beIr.errors = append(beIr.errors, err)
-					break
-				}
-
-				lambdaArn, err := buildLambdaARN(i.Spec.Aws, region)
-				if err != nil {
-					beIr.errors = append(beIr.errors, err)
-					break
-				}
-
-				endpointConfig, err := configureLambdaEndpoint(i.Spec.Aws)
-				if err != nil {
-					beIr.errors = append(beIr.errors, err)
-					return &beIr
-				}
-
-				var lambdaTransportSocket *envoycorev3.TransportSocket
-				if endpointConfig.useTLS {
-					// TODO(yuval-k): Add verification context
-					typedConfig, err := utils.MessageToAny(&envoytlsv3.UpstreamTlsContext{
-						Sni: endpointConfig.hostname,
-					})
-					if err != nil {
-						beIr.errors = append(beIr.errors, err)
-						break
-					}
-					lambdaTransportSocket = &envoycorev3.TransportSocket{
-						Name: envoywellknown.TransportSocketTls,
-						ConfigType: &envoycorev3.TransportSocket_TypedConfig{
-							TypedConfig: typedConfig,
-						},
-					}
-				}
-
-				lambdaFilters, err := buildLambdaFilters(
-					lambdaArn, region, i.Spec.Aws.Auth, secret, invokeMode, i.Spec.Aws.Lambda.PayloadTransformMode)
-				if err != nil {
-					beIr.errors = append(beIr.errors, err)
-					break
-				}
-
-				beIr.awsIr = &AwsIr{
-					lambdaIr: &LambdaIr{
-						lambdaEndpoint:        endpointConfig,
-						lambdaTransportSocket: lambdaTransportSocket,
-						lambdaFilters:         lambdaFilters,
-					},
-				}
-			case i.Spec.Aws.Ec2 != nil:
-				if !enableAwsEc2Discovery {
-					beIr.errors = append(beIr.errors, errAwsEc2DiscoveryDisabled)
-					break
-				}
-				secret, err := loadAWSSecret(krtctx, secrets, i)
-				if err != nil {
-					beIr.errors = append(beIr.errors, err)
-					break
-				}
-				ec2Ir, err := buildEc2Ir(i.Spec.Aws, secret)
-				if err != nil {
-					beIr.errors = append(beIr.errors, err)
-					break
-				}
-				beIr.awsIr = &AwsIr{ec2Ir: ec2Ir}
-			}
-		case i.Spec.Gcp != nil:
-			gcpIr, err := buildGcpIr(i.Spec.Gcp)
-			if err != nil {
-				beIr.errors = append(beIr.errors, err)
-			}
-			beIr.gcpIr = gcpIr
-		}
-		return &beIr
-	}
-}
-
-func loadAWSSecret(krtctx krt.HandlerContext, secrets *krtcollections.SecretIndex, backend *kgateway.Backend) (*ir.Secret, error) {
-	if backend.Spec.Aws == nil || backend.Spec.Aws.Auth == nil || backend.Spec.Aws.Auth.Type != kgateway.AwsAuthTypeSecret {
-		return nil, nil
-	}
-	if backend.Spec.Aws.Auth.SecretRef == nil {
-		return nil, fmt.Errorf("aws auth secretRef is required when type is %q", kgateway.AwsAuthTypeSecret)
-	}
-	if secrets == nil {
-		return nil, errors.New("aws secret lookup is unavailable")
-	}
-
-	secretName := backend.Spec.Aws.Auth.SecretRef.Name
-	secret, err := secrets.GetSecretWithoutRefGrant(krtctx, secretName, backend.GetNamespace())
-	if err != nil {
-		logAWSSecretReferenceError(backend, secretName, err)
-		return nil, err
-	}
-	return secret, nil
-}
-
-func logAWSSecretReferenceError(backend *kgateway.Backend, secretName string, err error) {
-	logger.Error(
-		"referenced AWS secret does not exist or could not be loaded",
-		"backend", fmt.Sprintf("%s/%s", backend.GetNamespace(), backend.GetName()),
-		"secret", fmt.Sprintf("%s/%s", backend.GetNamespace(), secretName),
-		"error", err,
-	)
-}
-
-func processBackendForEnvoy(ctx context.Context, in ir.BackendObjectIR, out *envoyclusterv3.Cluster) *ir.EndpointsForBackend {
-	be, ok := in.Obj.(*kgateway.Backend)
-	if !ok {
-		logger.Error("failed to cast backend object")
+// InitEnvoyBackend is an ir.BackendInit hook that configures out from the
+// kgateway.BackendSpec embedded in the backend object, whatever kind owns it. It is
+// exported so a plugin owning such a kind can use it directly, or wrap it to add
+// cluster configuration of its own.
+func InitEnvoyBackend(_ context.Context, in ir.BackendObjectIR, out *envoyclusterv3.Cluster) *ir.EndpointsForBackend {
+	spec := SpecOf(in.Obj)
+	if spec == nil {
+		logger.Error("failed to resolve backend spec", "backend", in.ResourceName())
 		return nil
 	}
-	beIr, ok := in.ObjIr.(*backendIr)
-	if !ok {
-		logger.Error("failed to cast backend ir")
+	beIr := IrOf(in.ObjIr)
+	if beIr == nil {
+		logger.Error("failed to resolve backend ir", "backend", in.ResourceName())
 		return nil
 	}
-
-	// TODO: propagated error to CRD #11558.
-	spec := be.Spec
-	switch {
-	case len(spec.PriorityGroups) > 0:
-		if beIr.priorityGroupsIr == nil {
-			return nil
-		}
-		processPriorityGroups(beIr.priorityGroupsIr, out)
-	case spec.Static != nil:
-		processStatic(beIr.staticIr, out)
-	case spec.Aws != nil:
-		if beIr.awsIr == nil {
-			return nil
-		}
-		if err := processAws(beIr.awsIr, out); err != nil {
-			logger.Error("failed to process aws backend", "error", err)
-			beIr.errors = append(beIr.errors, err)
-		}
-	case spec.DynamicForwardProxy != nil:
-		processDynamicForwardProxy(beIr.dfpIr, out)
-	case spec.Gcp != nil:
-		if err := processGcp(beIr.gcpIr, out); err != nil {
-			logger.Error("failed to process gcp backend", "error", err)
-			beIr.errors = append(beIr.errors, err)
-		}
-	}
+	ProcessForEnvoy(spec, beIr, out)
 	return nil
-}
-
-func parseAppProtocol(b *kgateway.Backend) ir.AppProtocol {
-	if b.Spec.Static != nil {
-		appProtocol := b.Spec.Static.AppProtocol
-		if appProtocol != nil {
-			return ir.ParseAppProtocol(new(string(*appProtocol)))
-		}
-	}
-	return ir.DefaultAppProtocol
-}
-
-// hostname returns the hostname for the backend. Only static backends are supported.
-func hostname(in *kgateway.Backend) string {
-	if in.Spec.Static == nil {
-		return ""
-	}
-	if len(in.Spec.Static.Hosts) == 0 {
-		return ""
-	}
-	return in.Spec.Static.Hosts[0].Host
 }
 
 type backendPlugin struct {
@@ -357,7 +175,12 @@ type backendPlugin struct {
 
 var _ ir.ProxyTranslationPass = &backendPlugin{}
 
-func newPlug(tctx ir.GwTranslationCtx, reporter reporter.Reporter) ir.ProxyTranslationPass {
+// NewTranslationPass returns the translation pass for the kgateway.BackendSpec
+// fields of a backend object, whatever kind owns it. It is exported so a plugin
+// owning a kind that embeds kgateway.BackendSpec can delegate to it for the embedded
+// fields; a pass is per-gateway-translation state, so a caller composing it with its
+// own must hold one instance per translation, not one per plugin.
+func NewTranslationPass(_ ir.GwTranslationCtx, _ reporter.Reporter) ir.ProxyTranslationPass {
 	return &backendPlugin{}
 }
 
@@ -366,15 +189,18 @@ func (p *backendPlugin) Name() string {
 }
 
 func (p *backendPlugin) ApplyForBackend(pCtx *ir.RouteBackendContext, in ir.HttpBackend, out *envoyroutev3.Route) error {
-	backend := pCtx.Backend.Obj.(*kgateway.Backend)
-	if backend.Spec.DynamicForwardProxy != nil {
+	spec := SpecOf(pCtx.Backend.Obj)
+	if spec == nil {
+		return nil
+	}
+	if spec.DynamicForwardProxy != nil {
 		if p.needsDfpFilter == nil {
 			p.needsDfpFilter = make(map[string]bool)
 		}
 		p.needsDfpFilter[pCtx.FilterChainName] = true
 	}
 
-	if backend.Spec.Gcp != nil {
+	if spec.Gcp != nil {
 		if p.needsGcpAuthn == nil {
 			p.needsGcpAuthn = make(map[string]bool)
 		}

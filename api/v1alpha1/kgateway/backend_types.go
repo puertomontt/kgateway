@@ -23,6 +23,7 @@ type Backend struct {
 	// +optional
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 	// +required
+	// +kubebuilder:validation:XValidation:message="exactly one of aws, static, dynamicForwardProxy, gcp or priorityGroups must be specified",rule="[has(self.aws),has(self.static),has(self.dynamicForwardProxy),has(self.gcp),has(self.priorityGroups)].filter(x,x==true).size() == 1"
 	Spec BackendSpec `json:"spec"`
 	// +optional
 	Status BackendStatus `json:"status,omitempty"`
@@ -44,13 +45,24 @@ const (
 	BackendTypePriorityGroups BackendType = "PriorityGroups"
 )
 
+// Cardinality lives in two halves, deliberately. This struct carries only "at most
+// one backend type"; the "at least one" half is on the Backend kind's spec field.
+// controller-gen propagates a struct's type-level XValidation rules onto every schema
+// that embeds it, so an ExactlyOneOf here would make a backend type added by an
+// embedding kind unrepresentable. The two halves together are equivalent to the
+// ExactlyOneOf they replace — the generated Backend CRD is unchanged in effect, only
+// in the message a violation reports.
+//
+// This comment is detached from the doc comment on purpose: it is a note to whoever
+// edits these markers next, not text for the CRD's description field.
+
 // BackendSpec defines the desired state of Backend.
 // +kubebuilder:validation:XValidation:message="aws backend must be specified when type is 'AWS'",rule="!has(self.type) || (self.type == 'AWS' ? has(self.aws) : true)"
 // +kubebuilder:validation:XValidation:message="static backend must be specified when type is 'Static'",rule="!has(self.type) || (self.type == 'Static' ? has(self.static) : true)"
 // +kubebuilder:validation:XValidation:message="dynamicForwardProxy backend must be specified when type is 'DynamicForwardProxy'",rule="!has(self.type) || (self.type == 'DynamicForwardProxy' ? has(self.dynamicForwardProxy) : true)"
 // +kubebuilder:validation:XValidation:message="gcp backend must be specified when type is 'GCP'",rule="!has(self.type) || (self.type == 'GCP' ? has(self.gcp) : true)"
 // +kubebuilder:validation:XValidation:message="priorityGroups backend must be specified when type is 'PriorityGroups'",rule="!has(self.type) || (self.type == 'PriorityGroups' ? has(self.priorityGroups) : true)"
-// +kubebuilder:validation:ExactlyOneOf=aws;static;dynamicForwardProxy;gcp;priorityGroups
+// +kubebuilder:validation:AtMostOneOf=aws;static;dynamicForwardProxy;gcp;priorityGroups
 type BackendSpec struct {
 	// Type indicates the type of the backend to be used.
 	// +kubebuilder:validation:Enum=AWS;Static;DynamicForwardProxy;GCP;PriorityGroups

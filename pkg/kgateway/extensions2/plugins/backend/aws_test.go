@@ -123,7 +123,7 @@ func TestBuildLambdaARNFallsBackToDeprecatedBackendAccountID(t *testing.T) {
 }
 
 func TestBuildTranslateFuncFailsClosedForLambdaEndpointWithoutPort(t *testing.T) {
-	translate := buildTranslateFunc(nil, nil, true)
+	translate := translateBackendForTest(nil, nil, true)
 
 	backendIR := translate(krt.TestingDummyContext{}, newLambdaBackend("lambda-backend", "https://lambda.us-east-1.amazonaws.com"))
 
@@ -145,8 +145,8 @@ func TestBackendIrEqualsDetectsLambdaErrorOnlyChanges(t *testing.T) {
 		},
 	}
 
-	missingSecretIR := buildTranslateFunc(nil, newSecretIndexForTest(t), true)(krt.TestingDummyContext{}, backend)
-	invalidSecretIR := buildTranslateFunc(nil, newSecretIndexForTest(t, &corev1.Secret{
+	missingSecretIR := translateBackendForTest(nil, newSecretIndexForTest(t), true)(krt.TestingDummyContext{}, backend)
+	invalidSecretIR := translateBackendForTest(nil, newSecretIndexForTest(t, &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "lambda-secret",
 			Namespace:       "kgateway-base",

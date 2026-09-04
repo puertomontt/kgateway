@@ -399,6 +399,10 @@ spec:
                 type: string
             type: object
             x-kubernetes-validations:
+            - message: exactly one of aws, static, dynamicForwardProxy, gcp or priorityGroups
+                must be specified
+              rule: '[has(self.aws),has(self.static),has(self.dynamicForwardProxy),has(self.gcp),has(self.priorityGroups)].filter(x,x==true).size()
+                == 1'
             - message: aws backend must be specified when type is 'AWS'
               rule: '!has(self.type) || (self.type == ''AWS'' ? has(self.aws) : true)'
             - message: static backend must be specified when type is 'Static'
@@ -413,10 +417,10 @@ spec:
             - message: priorityGroups backend must be specified when type is 'PriorityGroups'
               rule: '!has(self.type) || (self.type == ''PriorityGroups'' ? has(self.priorityGroups)
                 : true)'
-            - message: exactly one of the fields in [aws static dynamicForwardProxy
-                gcp priorityGroups] must be set
+            - message: at most one of the fields in [aws static dynamicForwardProxy
+                gcp priorityGroups] may be set
               rule: '[has(self.aws),has(self.static),has(self.dynamicForwardProxy),has(self.gcp),has(self.priorityGroups)].filter(x,x==true).size()
-                == 1'
+                <= 1'
           status:
             description: BackendStatus defines the observed state of Backend.
             properties:
