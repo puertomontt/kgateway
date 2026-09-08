@@ -265,11 +265,11 @@ func newErroredClusterFixture(t *testing.T) *erroredClusterFixture {
 func (f *erroredClusterFixture) breakCluster(name string) {
 	c := edsCluster(f.ucc, name, 99)
 	c.Error = errors.New(reproValidationErr)
-	f.clusterCols.bases.UpdateObject(baseFromCluster(c))
+	f.clusterCols.updateBase(c)
 }
 
 func (f *erroredClusterFixture) restoreCluster(name string) {
-	f.clusterCols.bases.UpdateObject(baseFromCluster(edsCluster(f.ucc, name, 100)))
+	f.clusterCols.updateBase(edsCluster(f.ucc, name, 100))
 }
 
 func (f *erroredClusterFixture) updateEndpoints(name string, localities int) {

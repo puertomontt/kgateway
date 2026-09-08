@@ -121,20 +121,13 @@ func TestSnapshotPerClient_CountsClusterDeferralsByReason(t *testing.T) {
 		NamespacedName: types.NamespacedName{Namespace: namespace, Name: gateway},
 	}})
 
-	// The delta set was evaluated before this client connected: the fence a
-	// connecting client hits once per backend.
-	baseRow := baseEnvoyCluster{
-		Name: "c", Cluster: sharedproto.Wrap(clusterNamed("c")), ClusterVersion: 1, Fingerprint: fingerprintBase(1),
-	}
-	unresolved := newClientInputSnapshot(nil)
-	baseCol := krt.NewStaticCollection(nil, []baseEnvoyCluster{baseRow})
-	deltaCol := krt.NewStaticCollection(nil, []backendClusterDeltaSet{{
-		Name:               "c",
-		BaseFingerprint:    baseRow.Fingerprint,
-		ClientsFingerprint: unresolved.Fingerprint,
-		ResolvedClients:    unresolved,
+	// The backend row was evaluated before this client connected: the fence a
+	// connecting client hits until every row has re-evaluated.
+	base := sharedproto.Wrap(clusterNamed("c"))
+	clusterCol := krt.NewStaticCollection(nil, []backendClusters{{
+		Name: "c", Cluster: base, ClusterVersion: 1, Clients: newClientInputSnapshot(nil),
 	}})
-	pcc := PerClientEnvoyClusters{base: baseCol, deltas: deltaCol}
+	pcc := PerClientEnvoyClusters{clusters: clusterCol}
 	endpointCol := krt.NewStaticCollection[UccWithEndpoints](nil, nil)
 
 	snapshots := snapshotPerClient(
@@ -166,14 +159,11 @@ func TestSnapshotPerClient_CountsClusterDeferralsByReason(t *testing.T) {
 	eventuallyDeferredClients(t, gateway, namespace, 1)
 	require.Empty(t, snapshots.List(), "an unresolved client must not have a snapshot")
 
-	// The delta set catches up with the connected client: the snapshot
+	// The backend row catches up with the connected client: the snapshot
 	// publishes and the client stops counting as deferred.
-	resolved := newClientInputSnapshot([]ir.UniquelyConnectedClient{ucc})
-	deltaCol.UpdateObject(backendClusterDeltaSet{
-		Name:               "c",
-		BaseFingerprint:    baseRow.Fingerprint,
-		ClientsFingerprint: resolved.Fingerprint,
-		ResolvedClients:    resolved,
+	clusterCol.UpdateObject(backendClusters{
+		Name: "c", Cluster: base, ClusterVersion: 1,
+		Clients: newClientInputSnapshot([]ir.UniquelyConnectedClient{ucc}),
 	})
 	require.Eventually(t, func() bool { return len(snapshots.List()) == 1 }, 2*time.Second, 10*time.Millisecond)
 	eventuallyDeferredClients(t, gateway, namespace, 0)

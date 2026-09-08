@@ -88,10 +88,11 @@ func snapshotPerClient(
 	clusterSnapshot := krt.NewCollection(uccCol, func(kctx krt.HandlerContext, ucc ir.UniquelyConnectedClient) *clustersWithErrors {
 		clustersForUcc, deferral := clusters.FetchClustersForClient(kctx, ucc)
 		if deferral != deferralNone {
-			// Expected once per connected client per base change while the
-			// deltas collection catches up (see FetchClustersForClient), so
-			// this is Debug. The counter carries the reason; a client that
-			// stays here shows on the deferred-clients gauge.
+			// Expected when a client connects or changes identity in place,
+			// while the backend rows re-evaluate against the new client set
+			// (see FetchClustersForClient), so this is Debug. The counter
+			// carries the reason; a client that stays here shows on the
+			// deferred-clients gauge.
 			recordClusterDeferral(ucc.ResourceName(), deferral)
 			logger.Debug("no perclient clusters; defer building snapshot",
 				"client", ucc.ResourceName(), "reason", deferral)
@@ -187,8 +188,8 @@ func snapshotPerClient(
 		// from observing that convergence window.
 		//
 		// Debug rather than Info: a cluster-row deferral upstream deletes that
-		// client's row and lands here once per client per base change, so at
-		// fleet scale this line would otherwise drown the signal it exists for.
+		// client's row and lands here on every client connect, so at fleet
+		// scale this line would otherwise drown the signal it exists for.
 		if clustersForUcc == nil || clientEndpointResources == nil {
 			logger.Debug("per-client inputs not ready; deferring snapshot", "client", ucc.ResourceName())
 			return nil

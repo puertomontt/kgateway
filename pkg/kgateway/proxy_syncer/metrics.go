@@ -53,10 +53,11 @@ var (
 		[]string{gatewayLabel, namespaceLabel, resourceLabel},
 	)
 	// snapshotClusterDeferralsTotal counts per-client cluster transforms that
-	// returned nothing, by the fence that failed (see clusterDeferral). A steady
-	// trickle is normal: one per connected client per base change. It cannot
-	// show a client that is stuck, because a transform only runs on events; that
-	// is what snapshotDeferredClients is for.
+	// returned nothing, by the fence that failed (see clusterDeferral). A small
+	// trickle is normal: one per client connect or in-place identity change,
+	// while the backend rows re-evaluate against the new client set. Backend
+	// changes never defer. It cannot show a client that is stuck, because a
+	// transform only runs on events; that is what snapshotDeferredClients is for.
 	snapshotClusterDeferralsTotal = metrics.NewCounter(
 		metrics.CounterOpts{
 			Subsystem: snapshotSubsystem,

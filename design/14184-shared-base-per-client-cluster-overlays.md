@@ -95,16 +95,13 @@ ready".
 ```mermaid
 flowchart LR
     FB["finalBackends<br/>(krt.Collection[*BackendObjectIR])"]
-    FB --> B["BaseEnvoyClusters<br/>one row per backend<br/>TranslateBackendBase()"]
-    FB --> D["PerClientEnvoyClusterDeltas<br/>one row per backend<br/>sparse map[ucc]delta<br/>ApplyPerClient()"]
-    UCC["UniquelyConnectedClients"] --> D
-    B -->|"FetchOne by cluster name"| D
-    B --> M["FetchClustersForClient(ucc)<br/>fence, then delta-wins"]
-    D -->|"krt.PartialFetch(forClient)"| M
+    FB --> B["BaseEnvoyClusters<br/>one row per backend<br/>TranslateBackendBase()<br/>carries the backend IR"]
+    B --> C["BackendEnvoyClusters<br/>one row per backend<br/>base + sparse map[ucc]delta<br/>+ evaluated-client snapshot<br/>ApplyPerClient()"]
+    UCC["UniquelyConnectedClients"] --> C
+    C -->|"krt.PartialFetch(forClient)"| M["FetchClustersForClient(ucc)<br/>resolved? then delta-wins"]
     UCC --> M
     M --> S["snapshotPerClient<br/>CDS payload"]
-    B --> ST["StatusClusters()<br/>base rows + errored deltas"]
-    D --> ST
+    C --> ST["StatusClusters()<br/>base rows + errored deltas"]
     ST --> BS["Backend status"]
 ```
 
@@ -151,44 +148,62 @@ shape as a base failure and the snapshot consumer's errored-cluster tracking is 
 
 ### Sparse CDS storage
 
-`PerClientEnvoyClusters` (`pkg/kgateway/proxy_syncer/backends.go`) becomes three collections
-instead of one flat per-pair collection:
+`PerClientEnvoyClusters` (`pkg/kgateway/proxy_syncer/backends.go`) is a linear chain of two
+collections, each with one row per backend, instead of one flat per-pair collection:
 
-- **`base`** — `krt.Collection[baseEnvoyCluster]`, keyed by cluster name, one row per backend.
-- **`deltas`** — `krt.Collection[backendClusterDeltaSet]`, also one row per backend, holding
-  `map[uccResourceName]uccClusterDelta` with entries only for clients that differ. The row
-  exists even when the map is empty; that is what records "evaluated, no overlay applies".
-- **`clients`** — the UCC collection, so a read can confirm the requesting client is still
-  connected without depending on the rest of the fleet.
+- **`base`** — `krt.Collection[baseEnvoyCluster]`, keyed by cluster name. The client-invariant
+  translation, plus the `*BackendObjectIR` it was translated from. Its `Equals` compares the
+  emitted cluster (by content version) *and* the carried IR (by `BackendObjectIR.Equals`, which
+  covers object metadata), so a metadata-only Service change — a label an overlay reads, with an
+  unchanged base proto — still re-runs the overlays. Client churn never reaches this collection.
+- **`clusters`** — `krt.Collection[backendClusters]`, derived from `base` with the UCC
+  collection as a secondary dependency. Each row carries the shared base it was built from, a
+  `map[uccResourceName]uccClusterDelta` with entries only for clients that differ, and a pointer
+  to the immutable client snapshot every client was evaluated against. Readers consume only this
+  collection. Its `Equals` is over emitted state only, so an input change whose overlays come
+  out identical publishes nothing downstream.
 
-`deltas` is driven off `finalBackends` (not off `uccs`) and fetches the already-computed base
-by key. Driving it off backends is what makes a backend *metadata-only* change — a Service
-label an overlay reads, with an unchanged base proto — still recompute deltas.
+Carrying the base inside the row is what makes the design linear: a backend change re-runs the
+overlays for that backend alone, against the base it just produced, and a reader can never
+combine a new base with overrides cloned from an older one. The two collections stay separate
+only so that client churn re-runs overlays without re-translating bases.
 
-That keyed lookup makes "the base row's key is `BackendObjectIR.ClusterName()`" load-bearing:
-a base with no matching delta set makes `FetchClustersForClient` withhold, so a cluster renamed
-during translation would blackhole every connected client rather than failing visibly. Nothing
-in tree renames it — `initializeCluster` and `buildBlackholeCluster` both take the name from
-`ClusterName`, and no plugin reassigns `Cluster.Name` — so the base transform checks the name
-it got and drops that one backend loudly instead. The blast radius of a future rename is then
-one backend, not the fleet.
+The base row's key is the cluster name the proto carries, which `initializeCluster` and
+`buildBlackholeCluster` both take from `BackendObjectIR.ClusterName()` — the name routes
+reference. A cluster renamed during translation would be published under a name nothing can
+reach, so the base transform checks the name and drops that one backend loudly rather than
+publish it silently. Nothing in tree renames it.
 
-#### Cross-collection coherence
+#### Client resolution
 
-Base and deltas are separate collections with no shared transaction, so a reader can observe
-one ahead of the other. Four fences make the merge safe; `FetchClustersForClient` validates the
-whole generation before exposing any row, because a partial base/delta mix would let
-`snapshotPerClient` publish an incoherent CDS payload.
+With the base inside the row there is no cross-collection coherence to check. One question
+remains for a reader: has this row evaluated the client asking? Sparse absence of a delta means
+"no overlay applies" only for a client the row has seen; for any other client it means nothing.
 
 | Fence | Mechanism | What it prevents |
 | --- | --- | --- |
-| Base generation | `baseClusterFingerprint{ClusterVersion}` stored on the delta set and compared against the live base | publishing deltas cloned from a superseded base |
-| Sparse absence | `clientInputSnapshot.ContainsCurrent(ucc)` — the exact immutable UCC snapshot the deltas were computed against | reading "no delta" as "no overlay applies" when the client was never evaluated |
-| Snapshot identity | `clientInputSnapshot.generation`, assigned by the interner behind its membership check and compared by `backendClusterDeltaSet.Equals` | a `ClientsFingerprint` collision retaining a stale snapshot, which withholds that client's CDS with no event able to recover it |
-| Inline CLA | `baseEnvoyCluster.NeedsInlineCLA` forces a materialized delta | publishing a host-less STRICT_DNS/STATIC cluster to a newly connected client |
-| Client identity | `krt.FetchOne(clients, FilterKey(ucc))` plus `Equals` | serving a client whose `KnowsLocalCluster` or labels have moved |
+| Client resolution | `clientInputSnapshot.ContainsCurrent(ucc)` on the snapshot the row points at | reading "no delta" as "no overlay applies" when the client was never evaluated, or was evaluated under a previous identity (`KnowsLocalCluster`, labels) |
 
-Two of those deserve emphasis.
+`FetchClustersForClient` withholds the client's whole CDS when any row fails it, so
+`snapshotPerClient` retains that client's last coherent snapshot until the rows catch up. The
+fence trips only on a client connect or an in-place identity change, and clears once every row
+has re-evaluated against the new client set; a backend change never trips it, because the base
+and its overrides arrive together. The deferral counter and the deferred-clients gauge make both
+the trickle and a stuck client visible.
+
+The snapshot is shared by pointer across every row of a batch through
+`clientInputSnapshotInterner`, which returns the same pointer for an unchanged client set and a
+new one otherwise, deciding by full UCC equality rather than a hash. `backendClusters.Equals`
+compares that pointer. This is the direction that is safe to get wrong: two snapshots with equal
+membership but different pointers cost one spurious recompute, whereas a stale snapshot retained
+as equal would withhold a client's CDS with no event left to recover it.
+
+Readiness is scoped **per requesting client**, not fleet-wide. `FetchClustersForClient` uses
+`krt.PartialFetch` with a projection to `clientClusterView` — the cluster this client is served
+plus the resolution bit — so another client's delta changing, or another client connecting,
+does not retrigger this client's CDS assembly. That is the property that keeps the sparse design
+from reintroducing the fleet-wide barrier of #13868/#14352: unrelated client churn can never
+withhold an established client's CDS.
 
 `baseClusterVersion` folds the inline endpoints hash **and** the attached-policy hash into the
 base proto hash when `SupportsInlineCLA` is true. The per-client CLA is built from
@@ -198,13 +213,11 @@ leave clients pinned to a stale `LoadAssignment` forever. It mirrors what
 `newFinalBackendEndpoints` already does for the EDS path. It is gated on `SupportsInlineCLA`
 so EDS clusters — whose endpoints flow through the separate EDS pipeline — do not churn.
 
-Readiness is scoped **per requesting client**, not fleet-wide. `FetchClustersForClient` uses
-`krt.PartialFetch` with a projection to `clientBackendDeltaView`, so another client's delta
-changing does not retrigger this client's CDS assembly; and it consults the resolution
-snapshot only when interpreting an *absent* sparse entry. A materialized delta carries the
-exact UCC it was computed for, which is proof enough on its own. This is the property that
-prevents the sparse design from reintroducing the fleet-wide barrier of #13868/#14352:
-unrelated client churn can never withhold an established client's CDS.
+A base that `NeedsInlineCLA` is never what a client receives: `ApplyPerClient` always
+materializes a per-client cluster for it, in the same row as the base, so a client sees either
+the complete cluster or is not yet resolved
+(`TestNewPerClientEnvoyClusters_InlineCLABackendNeverServesTheBase`). No read-side rule is
+needed for it.
 
 #### Interning and immutability
 
@@ -392,10 +405,9 @@ deltas contribute nothing. It is a collection rather than a `Fetch` helper so
 `backendStatusContributions` can index it by Backend: one client's cluster error then
 recomputes only its owning Backend's status.
 
-Status uses the same base-generation fence but, unlike CDS, **skips** a stale delta set instead
-of treating it as a barrier. Status has no cross-backend coherence requirement, and withholding
-every row mid-propagation would clear `Accepted` conditions that are still true. At worst a
-departed client's error lingers for one propagation.
+Status is a projection of the completed rows and applies no client-resolution check. Status has
+no per-client coherence requirement, and the same UCC event that moves the client set recomputes
+the row, so at worst a departed client's error lingers for one propagation.
 
 One observable output change follows from carrying base and per-client errors separately:
 errored clusters are omitted from emitted CDS, so seven gateway translation fixtures no longer
@@ -453,7 +465,7 @@ collection wrapped around it adds no per-backend copy of its own, which is what
 
 ### Delivery
 
-The work landed as a 6-PR stack rather than as #14343, so that the translator contract, the
+The work landed as a stack rather than as #14343, so that the translator contract, the
 KRT topology change, and the allocation optimizations can be reviewed and reverted
 independently.
 
@@ -465,6 +477,7 @@ independently.
 | 4 | #14603 | intern equivalent per-client cluster deltas | no |
 | 5 | #14604 | intern equivalent per-client CLAs, `LoadBalancingContextHash` | no |
 | 6 | #14605 | arm the immutability tripwire in e2e and conformance CI | no |
+| 7 | this PR | fold the base into the overlay row: one linear chain, one fence | **yes** |
 
 PRs 1-2 are shippable before the topology change. PR 2 deliberately keeps dense storage and
 an independently owned proto per row so reviewers can validate the translation contract
@@ -477,11 +490,10 @@ every point in the stack.
 **Unit.**
 - `backends_test.go` — `baseClusterVersion`: reflects inline-CLA endpoint and policy changes,
   stays stable for EDS endpoint changes, zero for errored bases.
-- `backends_merge_test.go` — every fence, individually: delta-wins, delta error over base
-  error, client filtering, matching delta needs no resolution proof, inline-CLA base withheld
-  until its delta arrives, stale delta rejected after a base update, waits for the current
-  client set, waits for the current local-cluster capability, and unrelated client churn is
-  *not* a readiness barrier.
+- `backends_merge_test.go` — resolution of a row for one client: delta-wins, delta error over
+  base error, client filtering, base and overrides move together, waits for the current client
+  set, waits for the current local-cluster capability, unrelated client churn is *not* a
+  readiness barrier, and each deferral reason is reported by name.
 - `backend_overlay_test.go`, `backend_validation_test.go` — overlay gathering, deterministic
   ordering, locality-default undo, strict-mode validation of overlay output.
 - `prioritize_test.go` — the CLA is byte-stable across repeated calls in all three priority
@@ -489,9 +501,9 @@ every point in the stack.
 - `editor_test.go` — structural sharing, legacy isolation, plugin ordering, allocations;
   `PolicyView` answers every question the plugins ask, including for a failed attachment;
   a policy-only change survives the `ReplaceEndpoints` path.
-- `backends_resolution_test.go` — a delta set whose resolved snapshot moved must not compare
-  equal even under a forced `ClientsFingerprint` collision; a renamed cluster drops only its
-  own backend instead of withholding the client's whole CDS.
+- `backends_resolution_test.go` — rows compare their client snapshot by identity: an unchanged
+  set reuses the snapshot, a changed set or an in-place identity change gets a new one; a
+  renamed cluster drops only its own backend.
 - `sharedproto_test.go` — tripwire fires on mutation, skips uncaptured protos, respects the
   flag; `Clone` independence; `BorrowForRead` aliases and stays tripwire-covered; identity
   helpers.
@@ -504,7 +516,7 @@ ordering regresses; its failure message names both causes and points at the byte
 first.
 
 **KRT integration.** `backends_integration_test.go` (sparse overlay wiring; backend
-metadata-only update recomputes deltas), `cla_intern_test.go` (equivalent clients share a CLA;
+metadata-only update recomputes deltas; an inline-CLA base is never served), `cla_intern_test.go` (equivalent clients share a CLA;
 distinct clients must not alias), `backends_disabled_pod_locality_test.go`
 (`DISABLE_POD_LOCALITY_XDS` shared-capability buckets without global withholding),
 `perclient_clusters_stress_test.go` (sustained trigger-driven churn never strands a stable
@@ -521,6 +533,20 @@ e2e suite and both conformance install paths, so a mutation after sharing surfac
 controller panic instead of a silent cross-client leak.
 
 ## Alternatives
+
+**Sibling base and delta collections joined by fingerprint.** The shape PR 3 first took:
+`deltas` driven off `finalBackends`, fetching the base by key, with the reader fenced on a
+`BaseFingerprint` stored in the delta set. Correct, but every backend change reached the reader
+twice — once with a stale delta set (deferred) and once with the matching one — and five
+distinct fences, a snapshot generation counter and a fleet fingerprint existed only to make the
+join safe. Folding the base into the delta row (PR 7) deletes all of that and leaves one fence.
+
+**Client-keyed overlay evaluation.** One collection keyed by client that fetches every base and
+runs `ApplyPerClient` inline; no fence of any kind, and a connecting client is served in one
+pass. Rejected because backend changes dominate client churn in production: every backend edit
+would re-run `ApplyPerClient` for every (client, backend) pair, and rebuild every
+client-dependent inline CLA, instead of the edited backend's overlays alone. The backend-keyed
+row keeps overlay evaluation local to the backend that changed.
 
 **Keep dense storage, share only the base translation.** This is exactly PR 2 of the stack,
 and it captures most of the CPU win with none of the synchronization risk. It was rejected as
@@ -540,8 +566,7 @@ beat proves user-visible.
 
 **A KRT collection between UCC events and delta recomputation** (rather than the
 `clientInputSnapshotInterner`). Cleaner dependency graph, but it adds a propagation hop
-between a client connecting and its deltas existing — which is precisely the window the
-inline-CLA withholding rule has to cover.
+between a client connecting and its deltas existing, lengthening the one deferral that remains.
 
 **Hash-free equality (`proto.Equal` on stored clusters).** Correct by construction, but
 `Equals` runs on every recompute for every row; a content hash computed once at store time is
@@ -553,12 +578,13 @@ that makes it sound.
 **A newly connected ambient client can see the un-overlaid base for one KRT propagation
 beat** before its waypoint delta is computed: in a sparse design, absence of a delta is
 indistinguishable from not-yet-computed. The deterministic half — 503s from CLA-less inline
-clusters — is closed by the `NeedsInlineCLA` withholding rule. Closing the waypoint beat needs
+clusters — cannot occur: the CLA-bearing override is built in the same row as the base, so the
+client-resolution fence covers it. Closing the waypoint beat needs
 a per-UCC computed marker, and naive whole-publish deferral is riskier than the beat. Needs a
 follow-up issue.
 
-**The recompute fan-out on client churn is unchanged.** The delta transform `Fetch`es the whole
+**The recompute fan-out on client churn is unchanged.** The overlay transform `Fetch`es the whole
 UCC collection, so any connect or disconnect re-runs it for every backend, and each run loops
-over every client calling `ApplyPerClient` and re-hashes the client set. Per-pair cost is now
+over every client calling `ApplyPerClient`. Per-pair cost is now
 small and retained state is sparse, but the `O(N*M)` event fan-out remains — the same as
 before this EP. Narrowing it is a [non-goal](#non-goals) here and a separate change.

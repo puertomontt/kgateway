@@ -18,14 +18,23 @@ import (
 	krtutil "github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/krtutil"
 )
 
-// baseEnvoyCluster is the UCC-invariant translation result for a single backend.
-// The Cluster proto is shared across every UCC that targets this backend — it is
-// read-only on the consumer side, and per-client mutations clone it before
-// modifying. This is the change that lets the per-client collection stay sparse.
+// baseEnvoyCluster is the prepared form of one backend: its client-invariant
+// translation, together with the backend IR it was translated from. The Cluster
+// proto is shared read-only by every client that targets this backend; per-client
+// mutations clone it. One row per backend, keyed by cluster name.
+//
+// The row's equality covers two kinds of input on purpose. The emitted fields
+// (ClusterVersion, Error, source identity) say whether the shared cluster
+// changed. Backend says whether anything a per-client overlay may read changed,
+// which includes Service metadata that never reaches the cluster proto: a label
+// flipping whether the waypoint overlay applies, for example. Either must re-run
+// the overlays, so both are compared here. Whether the overlay *output* changed
+// is decided one collection later, by backendClusters.Equals, so an input-only
+// change stops there.
 type baseEnvoyCluster struct {
 	// Name is both the Envoy cluster name and the KRT key; translation always
 	// names the cluster (blackhole included) after BackendObjectIR.ClusterName(),
-	// which is how the deltas builder looks bases up.
+	// which is the name routes reference.
 	Name string
 	// Cluster is wrapped so consumers cannot mutate the proto shared across
 	// every client snapshot; see package sharedproto. Content equality is
@@ -34,10 +43,6 @@ type baseEnvoyCluster struct {
 	// +noKrtEquals
 	Cluster        sharedproto.Shared[*envoyclusterv3.Cluster]
 	ClusterVersion uint64
-	// Fingerprint fences per-client deltas to the base cluster content they were
-	// cloned from. ClusterVersion includes the proto and any inline endpoint or
-	// policy inputs consumed later by ApplyPerClient.
-	Fingerprint baseClusterFingerprint
 	// Error is the translation error for this backend, if any. Compared by message in
 	// Equals because all errored clusters share one blackhole proto and baseClusterVersion
 	// collapses every error to 0, so ClusterVersion can't tell error states apart.
@@ -46,8 +51,11 @@ type baseEnvoyCluster struct {
 	BackendSource ir.ObjectSource
 	// BackendGeneration is the observed generation of the source Backend.
 	BackendGeneration int64
-	// NeedsInlineCLA is captured before Base.Cluster is sealed below.
-	NeedsInlineCLA bool
+	// Backend is the IR this base was translated from, carried forward so the
+	// overlay transform evaluates every client against exactly the inputs the
+	// base saw rather than re-fetching a possibly newer IR.
+	// +noKrtEquals compared through backendEquals
+	Backend *ir.BackendObjectIR
 	// Base is the non-proto portion of the base-translation result retained for
 	// per-client processing. Base.Cluster is always nil: the only retained copy
 	// of the shared proto lives behind Cluster, so future code cannot mutate it
@@ -61,22 +69,20 @@ func (b baseEnvoyCluster) ResourceName() string { return b.Name }
 func (b baseEnvoyCluster) Equals(in baseEnvoyCluster) bool {
 	return b.Name == in.Name &&
 		b.ClusterVersion == in.ClusterVersion &&
-		b.Fingerprint == in.Fingerprint &&
 		b.BackendSource == in.BackendSource &&
 		b.BackendGeneration == in.BackendGeneration &&
-		b.NeedsInlineCLA == in.NeedsInlineCLA &&
-		errString(b.Error) == errString(in.Error)
+		errString(b.Error) == errString(in.Error) &&
+		backendEquals(b.Backend, in.Backend)
 }
 
-// baseClusterFingerprint identifies the base cluster content a per-client delta
-// was cloned from. A delta set carrying a different ClusterVersion than the base
-// it is being merged with must not be published.
-type baseClusterFingerprint struct {
-	ClusterVersion uint64
-}
-
-func fingerprintBase(clusterVersion uint64) baseClusterFingerprint {
-	return baseClusterFingerprint{ClusterVersion: clusterVersion}
+// backendEquals compares two backend IRs by BackendObjectIR.Equals, which covers
+// object metadata (labels and annotations) as well as the spec generation, so a
+// metadata-only Service update re-runs the overlays that read it.
+func backendEquals(a, b *ir.BackendObjectIR) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.Equals(*b)
 }
 
 // uccClusterDelta is a per-client cluster materialized only when at least one
@@ -86,10 +92,10 @@ func fingerprintBase(clusterVersion uint64) baseClusterFingerprint {
 // carries the blackhole + error so the snapshot tracks it as errored for this
 // UCC only — other UCCs may still see a valid cluster).
 //
-// The containing backendClusterDeltaSet omits entries for the dominant case
-// where no overlay applies. This keeps actual delta storage O(N*K), where K is
-// the count of backends that genuinely vary per UCC, while one small resolution
-// row per backend disambiguates sparse absence.
+// The containing backendClusters row omits entries for the dominant case where
+// no overlay applies. This keeps actual delta storage O(N*K), where K is the
+// count of backends that genuinely vary per UCC, while the row's client snapshot
+// disambiguates sparse absence.
 type uccClusterDelta struct {
 	Client ir.UniquelyConnectedClient
 	Name   string
@@ -113,84 +119,34 @@ func (d uccClusterDelta) Equals(in uccClusterDelta) bool {
 
 // uccClusterResourceName builds the per-client identity key for a uccWithCluster
 // row. Deltas are not KRT rows — they live in a map keyed by UCC name inside
-// backendClusterDeltaSet and need no key of their own — and the uccWithCluster
-// rows that are (the status collection) are rebuilt per event, so there is
-// nothing to cache the key on the way UccWithEndpoints does. Plain concatenation
-// is still ~2.5x cheaper than fmt.Sprintf on these key shapes and allocates once
-// instead of three times.
+// backendClusters and need no key of their own — and the uccWithCluster rows
+// that are (the status collection) are rebuilt per event, so there is nothing to
+// cache the key on the way UccWithEndpoints does. Plain concatenation is still
+// ~2.5x cheaper than fmt.Sprintf on these key shapes and allocates once instead
+// of three times.
 func uccClusterResourceName(client ir.UniquelyConnectedClient, name string) string {
 	return client.ResourceName() + "/" + name
 }
 
-// clientSetFingerprint versions the complete UCC input consumed while a
-// backend's sparse delta set was evaluated. It drives KRT equality for the
-// retained snapshot; when a sparse delta is absent, read-side readiness uses
-// that snapshot's exact per-client membership rather than comparing this
-// fleet-wide value.
-type clientSetFingerprint uint64
-
-// fingerprintClients hashes the client set order-independently, over exactly the
-// fields an overlay can branch on (role, namespace, locality, labels, and local
-// cluster capability). Two calls agree if and only if every client an overlay
-// could distinguish is unchanged.
-func fingerprintClients(clients []ir.UniquelyConnectedClient) clientSetFingerprint {
-	ordered := slices.Clone(clients)
-	slices.SortFunc(ordered, func(a, b ir.UniquelyConnectedClient) int {
-		return cmp.Compare(a.ResourceName(), b.ResourceName())
-	})
-	hasher := fnv.New64a()
-	for _, client := range ordered {
-		utils.HashStringField(hasher, client.ResourceName())
-		utils.HashStringField(hasher, client.Role)
-		utils.HashStringField(hasher, client.Namespace)
-		utils.HashStringField(hasher, client.Locality.Region)
-		utils.HashStringField(hasher, client.Locality.Zone)
-		utils.HashStringField(hasher, client.Locality.Subzone)
-		utils.HashUint64(hasher, utils.HashLabels(client.Labels))
-		if client.KnowsLocalCluster {
-			utils.HashUint64(hasher, 1)
-		} else {
-			utils.HashUint64(hasher, 0)
-		}
-	}
-	return clientSetFingerprint(hasher.Sum64())
-}
-
-// clientInputSnapshot is one immutable view of the UCC collection. Every
-// backend delta set computed from this view retains a shallow copy of the
-// snapshot, so the Clients slice and byName map are shared across backends.
-// This lets a reader prove that one specific client was evaluated without
-// requiring every backend to agree on the latest fleet-wide generation.
+// clientInputSnapshot is one immutable view of the UCC collection, shared by
+// pointer across every backend row evaluated against it. A row proves that a
+// specific client was evaluated by pointing at a snapshot that contains that
+// client's exact current identity; rows evaluated against the same client set
+// point at the same snapshot, which is what backendClusters.Equals compares.
 type clientInputSnapshot struct {
-	Fingerprint clientSetFingerprint
-	// generation identifies this snapshot among those the interner has produced.
-	// It exists because Fingerprint alone is not safe to compare for equality:
-	// a delta set whose stored snapshot does not contain the requesting client
-	// withholds that client's CDS, and nothing re-triggers the transform once
-	// KRT has decided the row is unchanged. Two colliding fingerprints would
-	// therefore blackhole a client permanently. The interner only assigns a new
-	// generation after a full membership check, so equal generations mean the
-	// same client set, not merely the same hash.
-	// +noKrtEquals compared instead of, and more strictly than, Fingerprint
-	generation uint64
-	Clients    []ir.UniquelyConnectedClient
+	// Clients is sorted by ResourceName so evaluation order — and therefore
+	// which of several byte-identical per-client clusters gets interned first —
+	// is stable across recomputes.
+	Clients []ir.UniquelyConnectedClient
 	// byName is derived from Clients and is immutable after construction.
-	// +noKrtEquals
 	byName map[string]ir.UniquelyConnectedClient
 }
 
-func newClientInputSnapshot(clients []ir.UniquelyConnectedClient) clientInputSnapshot {
-	return newClientInputSnapshotWithFingerprint(clients, fingerprintClients(clients))
-}
-
-func newClientInputSnapshotWithFingerprint(
-	clients []ir.UniquelyConnectedClient,
-	fingerprint clientSetFingerprint,
-) clientInputSnapshot {
+func newClientInputSnapshot(clients []ir.UniquelyConnectedClient) *clientInputSnapshot {
 	ordered := slices.Clone(clients)
 	for i := range ordered {
 		// UCCs are values except for Labels. Clone that map so a plugin cannot
-		// mutate the resolution proof retained by every backend set. Clients and
+		// mutate the resolution proof retained by every backend row. Clients and
 		// byName below share these clones; both are immutable after construction.
 		ordered[i].Labels = maps.Clone(ordered[i].Labels)
 	}
@@ -201,14 +157,15 @@ func newClientInputSnapshotWithFingerprint(
 	for _, client := range ordered {
 		byName[client.ResourceName()] = client
 	}
-	return clientInputSnapshot{
-		Fingerprint: fingerprint,
-		Clients:     ordered,
-		byName:      byName,
+	return &clientInputSnapshot{
+		Clients: ordered,
+		byName:  byName,
 	}
 }
 
-func (s clientInputSnapshot) matches(clients []ir.UniquelyConnectedClient) bool {
+// matches reports whether clients is exactly the set this snapshot holds, by
+// full UCC equality rather than by key.
+func (s *clientInputSnapshot) matches(clients []ir.UniquelyConnectedClient) bool {
 	if len(s.Clients) != len(clients) {
 		return false
 	}
@@ -223,118 +180,86 @@ func (s clientInputSnapshot) matches(clients []ir.UniquelyConnectedClient) bool 
 
 // ContainsCurrent reports whether this snapshot evaluated the exact current
 // version of client. ResourceName alone is insufficient because fields that do
-// not participate in the key, notably KnowsLocalCluster, affect overlays.
-func (s clientInputSnapshot) ContainsCurrent(client ir.UniquelyConnectedClient) bool {
+// not participate in the key, notably KnowsLocalCluster, affect overlays. A nil
+// snapshot has evaluated nobody.
+func (s *clientInputSnapshot) ContainsCurrent(client ir.UniquelyConnectedClient) bool {
+	if s == nil {
+		return false
+	}
 	evaluated, ok := s.byName[client.ResourceName()]
 	return ok && evaluated.Equals(client)
 }
 
-// clientInputSnapshotInterner shares one immutable snapshot across backend
-// transforms without inserting another KRT collection between UCC events and
-// delta recomputation. It retains only the most recently requested snapshot;
-// older snapshots stay alive solely while backend delta sets still reference
-// their slices and maps during convergence.
+// clientInputSnapshotInterner hands every backend transform in a batch the same
+// snapshot pointer for the same client set, without inserting another KRT
+// collection between UCC events and overlay recomputation. It retains only the
+// most recently requested snapshot; older snapshots stay alive solely while
+// backend rows still reference them during convergence.
 type clientInputSnapshotInterner struct {
 	mu     sync.Mutex
 	latest *clientInputSnapshot
-	// generations numbers the distinct client sets this interner has seen, so a
-	// stored snapshot can be compared by identity rather than by hash. See
-	// clientInputSnapshot.generation.
-	generations uint64
 }
 
-func (i *clientInputSnapshotInterner) intern(clients []ir.UniquelyConnectedClient) clientInputSnapshot {
-	fingerprint := fingerprintClients(clients)
+func (i *clientInputSnapshotInterner) intern(clients []ir.UniquelyConnectedClient) *clientInputSnapshot {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	if i.latest != nil && i.latest.Fingerprint == fingerprint && i.latest.matches(clients) {
-		return *i.latest
+	if i.latest != nil && i.latest.matches(clients) {
+		return i.latest
 	}
-	// matches() above ruled out an equal client set, so this really is a new
-	// one. Numbering it here — behind the same membership check — is what makes
-	// generation equality stronger than fingerprint equality downstream.
-	i.generations++
-	snapshot := newClientInputSnapshotWithFingerprint(clients, fingerprint)
-	snapshot.generation = i.generations
-	i.latest = &snapshot
-	return snapshot
+	i.latest = newClientInputSnapshot(clients)
+	return i.latest
 }
 
-// backendClusterDeltaSet is the atomic sparse overlay result for one backend.
-// A row exists even when Deltas is empty. ResolvedClients disambiguates "this
-// exact client was evaluated and needs no overlay" from "this client was not
-// evaluated yet" without making unrelated fleet churn a readiness barrier.
-type backendClusterDeltaSet struct {
-	Name            string
-	BaseFingerprint baseClusterFingerprint
-	// ClientsFingerprint participates in KRT equality so a new resolution
-	// snapshot replaces the stored row. It is not a read-side readiness gate:
-	// readers consult only their own entry in ResolvedClients, and only when no
-	// materialized delta already proves that exact client was evaluated.
-	ClientsFingerprint clientSetFingerprint
-	// ResolvedClients is the exact immutable UCC snapshot consumed while Deltas
-	// was built. Equals compares its generation, which is stronger than
-	// ClientsFingerprint: the fingerprint is a hash, and a stale snapshot here
-	// withholds a client's CDS with nothing left to re-trigger the transform.
-	// +noKrtEquals generation is compared directly in Equals
-	ResolvedClients clientInputSnapshot
-	// Deltas contains only clients whose cluster genuinely differs from base.
+// backendClusters is the completed result for one backend: the shared base
+// cluster, the sparse per-client overrides evaluated against it, and the exact
+// client snapshot those overrides were evaluated with. Because the base and its
+// overrides travel in one row, a reader can never combine a new base with
+// overrides cloned from an older one; the only question left to a reader is
+// whether this row has evaluated the client asking. One row per backend, keyed
+// by cluster name.
+//
+// Equality is over emitted state only: an input change that leaves the base and
+// every override byte-identical does not publish a new row.
+type backendClusters struct {
+	Name string
+	// Cluster is the shared base, served to every client without an override.
+	// Content equality is carried by ClusterVersion together with Error.
 	// +noKrtEquals
+	Cluster        sharedproto.Shared[*envoyclusterv3.Cluster]
+	ClusterVersion uint64
+	// Error is the base translation error, compared by message; see baseEnvoyCluster.
+	Error error
+	// BackendSource identifies the Backend this cluster was translated from, for status attribution.
+	BackendSource ir.ObjectSource
+	// BackendGeneration is the observed generation of the source Backend.
+	BackendGeneration int64
+	// Clients is the immutable UCC snapshot Deltas was evaluated against. A
+	// client absent from Deltas but present in Clients was evaluated and needs
+	// no override; a client absent from Clients has not been evaluated by this
+	// row. Compared by identity: the interner returns one pointer per distinct
+	// client set, so a moved client set is always a different pointer, and a
+	// stale snapshot can never be retained as equal — which would withhold a
+	// client's CDS with no event left to recover it.
+	// +noKrtEquals compared by pointer identity
+	Clients *clientInputSnapshot
+	// Deltas contains only clients whose cluster genuinely differs from the base.
+	// +noKrtEquals compared entry-wise
 	Deltas map[string]uccClusterDelta
 }
 
-// clientBackendDeltaView is the portion of one backend's delta set relevant to
-// one requesting client. FetchClustersForClient uses it with krt.PartialFetch so
-// changes concerning other clients do not retrigger this client's CDS assembly.
-type clientBackendDeltaView struct {
-	Name            string
-	BaseFingerprint baseClusterFingerprint
-	Resolved        bool
-	HasDelta        bool
-	Delta           uccClusterDelta
-}
+func (b backendClusters) ResourceName() string { return b.Name }
 
-func (d clientBackendDeltaView) Equals(in clientBackendDeltaView) bool {
-	if d.Name != in.Name ||
-		d.BaseFingerprint != in.BaseFingerprint ||
-		d.HasDelta != in.HasDelta {
+func (b backendClusters) Equals(in backendClusters) bool {
+	if b.Name != in.Name ||
+		b.ClusterVersion != in.ClusterVersion ||
+		b.BackendSource != in.BackendSource ||
+		b.BackendGeneration != in.BackendGeneration ||
+		errString(b.Error) != errString(in.Error) ||
+		b.Clients != in.Clients ||
+		len(b.Deltas) != len(in.Deltas) {
 		return false
 	}
-	if d.HasDelta {
-		// A materialized delta carries its exact UCC input, so fleet-resolution
-		// changes are irrelevant while that delta remains current.
-		return d.Delta.Equals(in.Delta)
-	}
-	// Resolution is needed only to interpret sparse absence as an affirmative
-	// "no overlay applies" result.
-	return d.Resolved == in.Resolved
-}
-
-func (d backendClusterDeltaSet) forClient(client ir.UniquelyConnectedClient) clientBackendDeltaView {
-	delta, hasDelta := d.Deltas[client.ResourceName()]
-	return clientBackendDeltaView{
-		Name:            d.Name,
-		BaseFingerprint: d.BaseFingerprint,
-		Resolved:        d.ResolvedClients.ContainsCurrent(client),
-		HasDelta:        hasDelta,
-		Delta:           delta,
-	}
-}
-
-func (d backendClusterDeltaSet) ResourceName() string { return d.Name }
-
-func (d backendClusterDeltaSet) Equals(in backendClusterDeltaSet) bool {
-	if d.Name != in.Name ||
-		d.BaseFingerprint != in.BaseFingerprint ||
-		d.ClientsFingerprint != in.ClientsFingerprint ||
-		// Snapshot identity, not just its hash: see clientInputSnapshot.generation
-		// for why a fingerprint collision here would be unrecoverable. Rows built
-		// by hand (tests) carry generation 0 and fall back to the fingerprint.
-		d.ResolvedClients.generation != in.ResolvedClients.generation ||
-		len(d.Deltas) != len(in.Deltas) {
-		return false
-	}
-	for client, delta := range d.Deltas {
+	for client, delta := range b.Deltas {
 		other, ok := in.Deltas[client]
 		if !ok || !delta.Equals(other) {
 			return false
@@ -343,11 +268,59 @@ func (d backendClusterDeltaSet) Equals(in backendClusterDeltaSet) bool {
 	return true
 }
 
-// uccWithCluster is the merged view returned by FetchClustersForClient: the
-// resolved cluster (base or delta) along with any translation error and the
-// source Backend identity used for status attribution. It is also the row type
-// of the status-only collection built by StatusClusters, where the Cluster and
-// ClusterVersion fields are left zero because status does not read them.
+// clientClusterView is one client's reading of one backendClusters row: the
+// cluster that client should be served, and whether the row has evaluated the
+// client at all. FetchClustersForClient projects rows through it with
+// krt.PartialFetch, so a change that concerns other clients only — another
+// client's override appearing, say — does not retrigger this client's CDS
+// assembly.
+type clientClusterView struct {
+	// Resolved is false when the row has not evaluated this exact client. Only
+	// Cluster.Name is set then: nothing about the row can be served.
+	Resolved bool
+	Cluster  uccWithCluster
+}
+
+func (v clientClusterView) Equals(in clientClusterView) bool {
+	return v.Resolved == in.Resolved && v.Cluster.Equals(in.Cluster)
+}
+
+// forClient resolves one client against this row. A materialized delta wins on
+// cluster, name and version; its error wins over a base error because a
+// per-client failure (strict-mode validation of the post-overlay cluster) is
+// the more specific signal — and base errors short-circuit the overlay loop, so
+// a row with both is impossible in production. Backend identity always comes
+// from the base, which is where the source Backend is tracked.
+func (b backendClusters) forClient(client ir.UniquelyConnectedClient) clientClusterView {
+	if !b.Clients.ContainsCurrent(client) {
+		return clientClusterView{Cluster: uccWithCluster{Name: b.Name}}
+	}
+	out := uccWithCluster{
+		Client:            client,
+		Cluster:           b.Cluster,
+		ClusterVersion:    b.ClusterVersion,
+		Name:              b.Name,
+		Error:             b.Error,
+		BackendSource:     b.BackendSource,
+		BackendGeneration: b.BackendGeneration,
+	}
+	if d, ok := b.Deltas[client.ResourceName()]; ok {
+		out.Cluster = d.Cluster
+		out.ClusterVersion = d.ClusterVersion
+		out.Name = d.Name
+		if d.Error != nil {
+			out.Error = d.Error
+		}
+	}
+	return clientClusterView{Resolved: true, Cluster: out}
+}
+
+// uccWithCluster is the resolved view returned by FetchClustersForClient: the
+// cluster this client is served (base or delta) along with any translation
+// error and the source Backend identity used for status attribution. It is also
+// the row type of the status-only collection built by StatusClusters, where the
+// Cluster and ClusterVersion fields are left zero because status does not read
+// them.
 type uccWithCluster struct {
 	Client ir.UniquelyConnectedClient
 	// Cluster is wrapped so snapshot assembly cannot mutate the proto shared
@@ -419,119 +392,91 @@ func baseClusterVersion(backend *ir.BackendObjectIR, b *irtranslator.BaseCluster
 	return hasher.Sum64()
 }
 
-// PerClientEnvoyClusters is the cluster half of per-client xDS, stored as a base
-// plus a sparse overlay rather than one row per (client, backend) pair:
+// PerClientEnvoyClusters is the cluster half of per-client xDS, stored as one
+// row per backend rather than one per (client, backend) pair:
 //
-//   - base holds the UCC-invariant translation, one row per backend, whose Cluster
-//     proto is shared read-only by every client that targets it.
-//   - deltas holds one row per backend recording which clients — usually none —
-//     genuinely need a different cluster, and what it is.
+//   - base holds each backend's client-invariant translation together with the
+//     backend IR it came from. It exists so that client churn never re-runs
+//     base translation.
+//   - clusters holds each backend's completed result: the shared base, the
+//     sparse per-client overrides evaluated against it, and the client snapshot
+//     they were evaluated with. Readers consume only this collection.
 //
-// The requesting client is verified against the delta set itself, which retains
-// the exact UCC snapshot it was evaluated with. The UCC collection is deliberately
+// The requesting client is verified against the row itself, which retains the
+// exact UCC snapshot it was evaluated with. The UCC collection is deliberately
 // not held here: the transform that reads these is driven by that collection, so
 // KRT already hands it the current client, and fetching the parent again would
 // register a second handler on it (see FetchClustersForClient).
 //
-// Consumers never read the fields directly: FetchClustersForClient merges base and
-// delta into the view a snapshot needs, and StatusClusters projects the errors out
-// for status. Construct with [NewPerClientEnvoyClusters].
+// Consumers never read the fields directly: FetchClustersForClient resolves each
+// row for one client, and StatusClusters projects the errors out for status.
+// Construct with [NewPerClientEnvoyClusters].
 type PerClientEnvoyClusters struct {
-	base   krt.Collection[baseEnvoyCluster]
-	deltas krt.Collection[backendClusterDeltaSet]
+	base     krt.Collection[baseEnvoyCluster]
+	clusters krt.Collection[backendClusters]
 	// status is built once by the constructor. Deriving it on demand instead
 	// would let a second caller stand up a duplicate collection over the same
 	// inputs, which KRT has no way to flag.
 	status krt.Collection[uccWithCluster]
 }
 
-// HasSynced reports whether both the base and delta collections have synced.
-// Publishing is not gated on this (the readiness gates were reverted in favor
-// of the first-connect grace period, #14380); it exists for callers — currently
-// tests — that need to wait for cluster translation to reach steady state.
+// HasSynced reports whether both collections have synced. Publishing is not
+// gated on this (the readiness gates were reverted in favor of the
+// first-connect grace period, #14380); it exists for callers — currently tests —
+// that need to wait for cluster translation to reach steady state.
 func (iu *PerClientEnvoyClusters) HasSynced() bool {
 	if iu.base != nil && !iu.base.HasSynced() {
 		return false
 	}
-	if iu.deltas != nil && !iu.deltas.HasSynced() {
+	if iu.clusters != nil && !iu.clusters.HasSynced() {
 		return false
 	}
 	return true
 }
 
 // clusterDeferral names the fence that made FetchClustersForClient return
-// nothing. The empty value means the merged view was complete. The others are
+// nothing. The empty value means the resolved view was complete. The others are
 // Prometheus label values on snapshotClusterDeferralsTotal, so renaming one
 // breaks dashboards.
 type clusterDeferral string
 
 const (
-	// deferralNone: every row passed the fences and was returned.
+	// deferralNone: every row had evaluated this client and was returned.
 	deferralNone clusterDeferral = ""
-	// deferralMissingDeltaSet: a base row has no delta set yet. Expected once
-	// per new backend while the deltas collection catches up.
-	deferralMissingDeltaSet clusterDeferral = "missing_delta_set"
-	// deferralStaleDeltaSet: a delta set was evaluated against an older base.
-	// Expected once per base change; see the ordering note on
-	// FetchClustersForClient.
-	deferralStaleDeltaSet clusterDeferral = "stale_delta_set"
-	// deferralStaleDeltaClient: a materialized delta was built for a previous
-	// version of this client.
-	deferralStaleDeltaClient clusterDeferral = "stale_delta_client"
-	// deferralUnresolvedClient: a delta set has not evaluated this client, so
+	// deferralUnresolvedClient: a row has not evaluated this exact client, so
 	// sparse absence cannot yet be read as "no overlay applies". Expected once
-	// per backend when a client connects.
+	// when a client connects or changes identity in place, while the backend
+	// rows re-evaluate against the new client set.
 	deferralUnresolvedClient clusterDeferral = "unresolved_client"
-	// deferralMissingInlineCLA: an inline-CLA base has no delta for this
-	// client; publishing it would send Envoy a host-less STATIC or STRICT_DNS
-	// cluster.
-	deferralMissingInlineCLA clusterDeferral = "missing_inline_cla"
-	// deferralNoBackends: there are no base clusters at all. Unreachable in a
+	// deferralNoBackends: there are no backend rows at all. Unreachable in a
 	// real cluster, where kubernetes.default alone is a backend; common in
 	// tests.
 	deferralNoBackends clusterDeferral = "no_backends"
 )
 
-// FetchClustersForClient returns the merged set of clusters for a UCC: a
-// per-client delta for each backend that has one, and the shared base cluster
-// otherwise. Before returning anything it verifies that every backend's atomic
-// delta set was evaluated against the current base and this exact client. A
-// mismatch returns no rows plus the fence that failed, causing snapshot
-// assembly to retain this client's last coherent xDS snapshot while the
-// dependent KRT transforms catch up. Exactly one of the two results is
+// FetchClustersForClient returns one cluster per backend for a UCC: the client's
+// own override where it has one, the shared base otherwise. Every row carries
+// the base its overrides were cloned from, so there is no cross-row coherence to
+// check; the one thing verified before returning anything is that every row has
+// evaluated this exact client. A row that has not returns no rows plus the fence
+// that failed, causing snapshot assembly to retain this client's last coherent
+// xDS snapshot until the rows catch up. Exactly one of the two results is
 // non-empty.
 //
-// A deferral is expected, not exceptional, once per base change. The deltas
-// collection recomputes from the same event on its own queue, so the transform
-// calling this usually observes the new base before the matching delta set
-// lands, returns nothing, and runs again when it does. That extra pass is the
-// cost of keeping base and deltas as sibling collections; a delta set that
-// carried its own base would remove it. Its rate is visible on
-// snapshotClusterDeferralsTotal by reason, and a client that stays deferred
-// shows on snapshotDeferredClients.
+// A deferral is expected when a client connects or changes identity in place:
+// its snapshot transform runs on that event before the backend rows have
+// re-evaluated against the new client set, and runs again when they have. A
+// backend change never defers, because the base and its overrides arrive in the
+// same row. The rate is visible on snapshotClusterDeferralsTotal by reason, and
+// a client that stays deferred shows on snapshotDeferredClients.
 //
-// The *Cluster protos in the returned slice are shared with other UCCs (base)
-// or unique to this UCC (delta); callers MUST NOT mutate them.
+// The *Cluster protos in the returned slice are shared with other UCCs (base) or
+// interned across the UCCs whose overrides came out identical; callers MUST NOT
+// mutate them.
 func (iu *PerClientEnvoyClusters) FetchClustersForClient(kctx krt.HandlerContext, ucc ir.UniquelyConnectedClient) ([]uccWithCluster, clusterDeferral) {
-	var bases []baseEnvoyCluster
-	if iu.base != nil {
-		bases = krt.Fetch(kctx, iu.base)
+	if iu.clusters == nil {
+		return nil, deferralNoBackends
 	}
-	var deltaViews []clientBackendDeltaView
-	if iu.deltas != nil {
-		deltaViews = krt.PartialFetch(kctx, iu.deltas,
-			func(set backendClusterDeltaSet) clientBackendDeltaView {
-				return set.forClient(ucc)
-			},
-			clientBackendDeltaView.Equals,
-		)
-	}
-
-	deltaViewByName := make(map[string]clientBackendDeltaView, len(deltaViews))
-	for _, view := range deltaViews {
-		deltaViewByName[view.Name] = view
-	}
-
 	// ucc is not re-fetched from the UCC collection. The calling transform is
 	// keyed by that collection, and KRT passes it the parent's current stored
 	// object on both the primary and the secondary-dependency path, so a keyed
@@ -539,74 +484,24 @@ func (iu *PerClientEnvoyClusters) FetchClustersForClient(kctx krt.HandlerContext
 	// and this call, when the queued primary event reruns the transform anyway.
 	// It would also register a second handler on the UCC collection and
 	// recompute every changed client twice. Whether THIS client's identity is
-	// what each delta set evaluated is checked below against the set itself.
-
-	if len(bases) == 0 {
+	// what each row evaluated is checked below against the row itself.
+	views := krt.PartialFetch(kctx, iu.clusters,
+		func(b backendClusters) clientClusterView { return b.forClient(ucc) },
+		clientClusterView.Equals,
+	)
+	if len(views) == 0 {
 		return nil, deferralNoBackends
 	}
 
-	// Validate the entire generation before exposing any row. Returning a
-	// partial base/delta mix would let snapshotPerClient publish an incoherent
-	// CDS payload while collections converge.
-	for _, b := range bases {
-		view, ok := deltaViewByName[b.Name]
-		if !ok {
-			return nil, deferralMissingDeltaSet
+	// Validate every row before exposing any. A partial view would let
+	// snapshotPerClient publish a CDS payload missing the clusters that have
+	// not caught up, which Envoy would apply.
+	out := make([]uccWithCluster, 0, len(views))
+	for _, view := range views {
+		if !view.Resolved {
+			return nil, deferralUnresolvedClient
 		}
-		if view.BaseFingerprint != b.Fingerprint {
-			return nil, deferralStaleDeltaSet
-		}
-		if view.HasDelta {
-			if !view.Delta.Client.Equals(ucc) {
-				return nil, deferralStaleDeltaClient
-			}
-		} else {
-			if !view.Resolved {
-				return nil, deferralUnresolvedClient
-			}
-			if b.NeedsInlineCLA {
-				// Inline-CLA bases must always materialize a per-client delta.
-				return nil, deferralMissingInlineCLA
-			}
-		}
-	}
-
-	out := make([]uccWithCluster, 0, len(bases))
-	for _, b := range bases {
-		view := deltaViewByName[b.Name]
-		if view.HasDelta {
-			d := view.Delta
-			// Delta wins on cluster + version. Delta error wins over base error
-			// because a per-UCC failure (e.g. strict-mode validation of the
-			// post-overlay cluster) is the more specific signal — base errors
-			// are caught by the short-circuit in the deltas builder, so reaching
-			// this branch with a base.Error set is impossible in production.
-			// Backend identity always comes from the base, which is where the
-			// source Backend is tracked.
-			derr := d.Error
-			if derr == nil {
-				derr = b.Error
-			}
-			out = append(out, uccWithCluster{
-				Client:            ucc,
-				Cluster:           d.Cluster,
-				ClusterVersion:    d.ClusterVersion,
-				Name:              d.Name,
-				Error:             derr,
-				BackendSource:     b.BackendSource,
-				BackendGeneration: b.BackendGeneration,
-			})
-			continue
-		}
-		out = append(out, uccWithCluster{
-			Client:            ucc,
-			Cluster:           b.Cluster,
-			ClusterVersion:    b.ClusterVersion,
-			Name:              b.Name,
-			Error:             b.Error,
-			BackendSource:     b.BackendSource,
-			BackendGeneration: b.BackendGeneration,
-		})
+		out = append(out, view.Cluster)
 	}
 	return out, deferralNone
 }
@@ -619,50 +514,38 @@ func (iu *PerClientEnvoyClusters) StatusClusters() krt.Collection[uccWithCluster
 }
 
 // newStatusClusters builds the cluster view needed for fleet-wide Backend status
-// attribution: one row per base cluster (carrying the source Backend identity and
-// any UCC-invariant translation error) plus one row per errored per-client delta
-// (carrying the per-client translation error attributed to the same Backend). Only
-// Name, Error, BackendSource, BackendGeneration — and Client on delta rows — are
-// populated; those are the fields GenerateBackendStatusReport consumes. Non-errored
-// deltas contribute nothing to status and are skipped.
+// attribution: one row per backend (carrying the source Backend identity and any
+// UCC-invariant translation error) plus one row per errored per-client override
+// (carrying the per-client translation error attributed to the same Backend).
+// Only Name, Error, BackendSource, BackendGeneration — and Client on override
+// rows — are populated; those are the fields GenerateBackendStatusReport
+// consumes. Non-errored overrides contribute nothing to status and are skipped.
 //
 // This is a collection rather than a Fetch helper because backendStatusContributions
 // indexes it by Backend: one client's cluster error then recomputes only its owning
 // Backend's status, not every Backend's.
 //
-// Unlike FetchClustersForClient, a stale delta set is skipped rather than treated as
-// a barrier. Status has no cross-backend coherence requirement, and withholding every
-// row mid-propagation would clear Accepted conditions that are still true. The
-// resolved-client snapshot is deliberately not re-checked here. A delta set whose
-// inputs moved is recomputed anyway (ClientsFingerprint participates in its Equals),
-// so at worst a departed client's error lingers for one propagation.
+// Unlike FetchClustersForClient, no client-resolution check is applied. Status
+// has no per-client coherence requirement, and the same UCC event that moves the
+// client set recomputes the row, so at worst a departed client's error lingers
+// for one propagation.
 func newStatusClusters(
 	krtopts krtutil.KrtOptions,
-	base krt.Collection[baseEnvoyCluster],
-	deltas krt.Collection[backendClusterDeltaSet],
+	clusters krt.Collection[backendClusters],
 ) krt.Collection[uccWithCluster] {
-	if base == nil {
+	if clusters == nil {
 		return krt.NewStaticCollection[uccWithCluster](nil, nil, krtopts.ToOptions("BackendStatusClusters")...)
 	}
-	return krt.NewManyCollection(base, func(kctx krt.HandlerContext, b baseEnvoyCluster) []uccWithCluster {
+	return krt.NewManyCollection(clusters, func(_ krt.HandlerContext, b backendClusters) []uccWithCluster {
 		// The base row carries the zero UCC, whose ResourceName is empty; a connected
-		// client's never is, so base and delta rows cannot collide on the KRT key.
+		// client's never is, so base and override rows cannot collide on the KRT key.
 		out := []uccWithCluster{{
 			Name:              b.Name,
 			Error:             b.Error,
 			BackendSource:     b.BackendSource,
 			BackendGeneration: b.BackendGeneration,
 		}}
-		if deltas == nil {
-			return out
-		}
-		// The delta set's KRT key is its backend's cluster name, so a keyed FetchOne
-		// is both the narrowest dependency and cheaper than a secondary index.
-		set := krt.FetchOne(kctx, deltas, krt.FilterKey(b.Name))
-		if set == nil || set.BaseFingerprint != b.Fingerprint {
-			return out
-		}
-		for _, d := range set.Deltas {
+		for _, d := range b.Deltas {
 			if d.Error == nil {
 				continue
 			}
@@ -678,7 +561,7 @@ func newStatusClusters(
 	}, krtopts.ToOptions("BackendStatusClusters")...)
 }
 
-// NewPerClientEnvoyClusters builds the base and delta collections that back
+// NewPerClientEnvoyClusters builds the collections that back
 // [PerClientEnvoyClusters], translating every backend in finalBackends into an
 // Envoy cluster for every client in uccs.
 //
@@ -687,13 +570,13 @@ func newStatusClusters(
 // client is then offered a cheap overlay on top of it. Only the (client, backend)
 // pairs whose cluster genuinely differs — a matching destination rule, a waypoint
 // redirect, an inline CLA, a per-client validation failure — materialize a delta.
-// For a fleet where few backends vary per client, storage and translation cost stay
-// close to O(backends) instead of O(backends * clients).
+// For a fleet where few backends vary per client, storage and translation cost
+// stay close to O(backends) instead of O(backends * clients).
 //
-// The two collections are versioned against each other by fingerprint, and each
-// delta set retains the immutable client snapshot it consumed. A consumer can
-// therefore verify the base generation and the requesting client independently.
-// See FetchClustersForClient for how that is enforced.
+// The chain is linear: base rows feed the overlay transform, whose rows carry
+// the base they were evaluated against. A backend change therefore re-runs the
+// overlays for that backend alone, against the base it just produced, and a
+// reader never has to reconcile a base with overrides from another generation.
 func NewPerClientEnvoyClusters(
 	ctx context.Context,
 	krtopts krtutil.KrtOptions,
@@ -702,7 +585,7 @@ func NewPerClientEnvoyClusters(
 	uccs krt.Collection[ir.UniquelyConnectedClient],
 ) PerClientEnvoyClusters {
 	// Share immutable UCC snapshots across backend transforms without adding an
-	// extra KRT propagation hop between a UCC event and delta recomputation.
+	// extra KRT propagation hop between a UCC event and overlay recomputation.
 	clientInputs := &clientInputSnapshotInterner{}
 
 	// Base clusters: one entry per backend, computed once and shared across all
@@ -717,25 +600,22 @@ func NewPerClientEnvoyClusters(
 		}
 		name := baseRes.Cluster.GetName()
 		if name != backendObj.ClusterName() {
-			// The delta transform finds this row by the backend's memoized
-			// ClusterName, and FetchClustersForClient withholds a client's
-			// entire CDS for any base that has no matching delta set. A renamed
-			// cluster would therefore blackhole every connected client
-			// permanently, with no event able to recover it. Nothing in tree
-			// renames the cluster (initializeCluster and buildBlackholeCluster
-			// both take the name from ClusterName, and no plugin reassigns it);
-			// if that changes, drop this one backend loudly rather than the
-			// whole fleet silently.
+			// Routes reference this backend by its memoized ClusterName, and
+			// the per-backend rows are keyed by the name the proto carries. A
+			// renamed cluster would be served under a name nothing references.
+			// Nothing in tree renames the cluster (initializeCluster and
+			// buildBlackholeCluster both take the name from ClusterName, and no
+			// plugin reassigns it); if that changes, drop this one backend
+			// loudly rather than publish an unreachable cluster silently.
 			logger.Error("backend translation renamed the cluster; dropping the backend",
 				"backend", backendObj.ResourceName(),
 				"expected", backendObj.ClusterName(), "got", name)
 			return nil
 		}
 		clusterVersion := baseClusterVersion(backendObj, baseRes)
-		needsInlineCLA := baseRes.NeedsInlineCLA()
 		sharedCluster := sharedproto.Wrap(baseRes.Cluster)
 		// Seal the only retained raw alias. Per-client processing reconstructs a
-		// temporary BaseCluster whose Cluster is cloned from sharedCluster.
+		// temporary BaseCluster whose Cluster is borrowed from sharedCluster.
 		baseRes.Cluster = nil
 		var backendGeneration int64
 		if backendObj.Obj != nil {
@@ -745,46 +625,37 @@ func NewPerClientEnvoyClusters(
 			Name:              name,
 			Cluster:           sharedCluster,
 			ClusterVersion:    clusterVersion,
-			Fingerprint:       fingerprintBase(clusterVersion),
 			Error:             baseRes.Error,
 			BackendSource:     backendObj.GetObjectSource(),
 			BackendGeneration: backendGeneration,
-			NeedsInlineCLA:    needsInlineCLA,
+			Backend:           backendObj,
 			Base:              baseRes,
 		}
 	}, krtopts.ToOptions("BaseEnvoyClusters")...)
 
-	// Per-client deltas: only emitted for (ucc, backend) pairs that genuinely
-	// vary — at least one PerClientClusterOverlay returned non-nil, or the
-	// cluster requires a UCC-dependent inline CLA. Most pairs emit nothing,
-	// which is what keeps the collection sparse.
-	//
-	// Driven off finalBackends so backend metadata-only updates (for example
-	// Service labels consumed by an overlay) recompute deltas even when the
-	// shared base cluster remains equal. The already-computed base is fetched
-	// and reused, so UCC churn still does not re-translate base clusters.
-	deltas := krt.NewCollection(finalBackends, func(kctx krt.HandlerContext, backendObj *ir.BackendObjectIR) *backendClusterDeltaSet {
-		if backendObj == nil {
-			return nil
-		}
-		// Base rows are keyed by cluster name, which translation always derives
-		// from the backend's memoized ClusterName (blackhole included).
-		baseObj := krt.FetchOne(kctx, base, krt.FilterKey(backendObj.ClusterName()))
-		if baseObj == nil {
-			return nil
-		}
-		b := *baseObj
+	// Completed rows: the base plus the sparse per-client overrides evaluated
+	// against it. Driven off base, so a backend change re-runs exactly this
+	// backend's overlays against the base it just produced — including a
+	// metadata-only change, which baseEnvoyCluster.Equals surfaces through the
+	// carried IR — and a client change re-runs every backend's overlays against
+	// the already-translated base without re-translating it. Most (client,
+	// backend) pairs emit nothing, which is what keeps the rows sparse.
+	clusters := krt.NewCollection(base, func(kctx krt.HandlerContext, b baseEnvoyCluster) *backendClusters {
 		clientSnapshot := clientInputs.intern(krt.Fetch(kctx, uccs))
-		set := &backendClusterDeltaSet{
-			Name:               b.Name,
-			BaseFingerprint:    b.Fingerprint,
-			ClientsFingerprint: clientSnapshot.Fingerprint,
-			ResolvedClients:    clientSnapshot,
+		out := &backendClusters{
+			Name:              b.Name,
+			Cluster:           b.Cluster,
+			ClusterVersion:    b.ClusterVersion,
+			Error:             b.Error,
+			BackendSource:     b.BackendSource,
+			BackendGeneration: b.BackendGeneration,
+			Clients:           clientSnapshot,
 		}
 		if b.Error != nil || b.Base == nil {
 			// Errored base: every UCC sees the same blackhole, no per-client
-			// variation possible. The empty set explicitly records resolution.
-			return set
+			// variation possible. The row still records which clients it
+			// evaluated.
+			return out
 		}
 		// Intern identical per-client clusters across UCCs. Inline-CLA backends
 		// materialize a delta for every UCC, but UCCs that share the relevant
@@ -801,7 +672,7 @@ func NewPerClientEnvoyClusters(
 		perClientBase := *b.Base
 		perClientBase.Cluster = b.Cluster.BorrowForRead()
 		for _, ucc := range clientSnapshot.Clients {
-			perClient, err := translator.ApplyPerClient(kctx, ctx, ucc, backendObj, &perClientBase)
+			perClient, err := translator.ApplyPerClient(kctx, ctx, ucc, b.Backend, &perClientBase)
 			if err != nil {
 				// Emit a delta entry that carries the error so the snapshot
 				// tracks this cluster as errored for THIS UCC only. Falling
@@ -814,10 +685,10 @@ func NewPerClientEnvoyClusters(
 				if perClient != nil {
 					name = perClient.GetName()
 				}
-				if set.Deltas == nil {
-					set.Deltas = make(map[string]uccClusterDelta)
+				if out.Deltas == nil {
+					out.Deltas = make(map[string]uccClusterDelta)
 				}
-				set.Deltas[ucc.ResourceName()] = uccClusterDelta{
+				out.Deltas[ucc.ResourceName()] = uccClusterDelta{
 					Client: ucc,
 					Name:   name,
 					// Hash 0: errored rows are never published, so they opt
@@ -829,28 +700,28 @@ func NewPerClientEnvoyClusters(
 				continue
 			}
 			if perClient == nil {
-				// No per-client variation. Snapshot will reference the shared
+				// No per-client variation. The client is served the shared
 				// base cluster instead.
 				continue
 			}
 			clusterVersion := utils.HashProto(perClient)
 			shared := clusterInterner.InternPrehashed(perClient, clusterVersion)
-			if set.Deltas == nil {
-				set.Deltas = make(map[string]uccClusterDelta)
+			if out.Deltas == nil {
+				out.Deltas = make(map[string]uccClusterDelta)
 			}
-			set.Deltas[ucc.ResourceName()] = uccClusterDelta{
+			out.Deltas[ucc.ResourceName()] = uccClusterDelta{
 				Client:         ucc,
 				Name:           perClient.GetName(),
 				Cluster:        shared,
 				ClusterVersion: clusterVersion,
 			}
 		}
-		return set
-	}, krtopts.ToOptions("PerClientEnvoyClusterDeltas")...)
+		return out
+	}, krtopts.ToOptions("BackendEnvoyClusters")...)
 
 	return PerClientEnvoyClusters{
-		base:   base,
-		deltas: deltas,
-		status: newStatusClusters(krtopts, base, deltas),
+		base:     base,
+		clusters: clusters,
+		status:   newStatusClusters(krtopts, clusters),
 	}
 }

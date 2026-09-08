@@ -21,8 +21,8 @@ import (
 )
 
 // TestNewPerClientEnvoyClusters_SparseOverlayWiring exercises the real KRT
-// wiring end-to-end (base collection -> atomic sparse delta sets ->
-// FetchClustersForClient merge) rather than the static-collection test helpers.
+// wiring end-to-end (base collection -> completed backend rows ->
+// FetchClustersForClient resolution) rather than the static-collection test helpers.
 // It pins the headline behaviors of the base+overlay split:
 //
 //   - A UCC the overlay declines sees the shared base proto (no delta emitted).
@@ -102,7 +102,7 @@ func TestNewPerClientEnvoyClusters_SparseOverlayWiring(t *testing.T) {
 	assert.True(t, sharedproto.Same(gotA[0].Cluster, gotB[0].Cluster),
 		"clients whose overlay output is byte-identical must share one interned proto")
 
-	// The delta transform lends the base proto to ApplyPerClient rather than
+	// The overlay transform lends the base proto to ApplyPerClient rather than
 	// handing it a defensive copy, so the overlay pass above ran against the
 	// very proto the declined client is served. Publishing it through the
 	// snapshot sink re-verifies its wrap-time hash (TestMain arms the tripwire),
@@ -114,10 +114,9 @@ func TestNewPerClientEnvoyClusters_SparseOverlayWiring(t *testing.T) {
 // TestNewPerClientEnvoyClusters_BackendMetadataUpdateRecomputesDeltas covers
 // the waypoint ingress-use-waypoint failure mode: a metadata-only Service label
 // update changes whether a per-client overlay applies, even though the shared
-// base cluster is byte-identical. Deltas must recompute from the backend update
-// itself, not only from base cluster equality changes. This is why the base
-// fence only needs ClusterVersion: finalBackends remains the delta transform's
-// primary input and carries metadata changes independently.
+// base cluster is byte-identical. The overlay transform is driven off the base
+// row, so this only works because baseEnvoyCluster.Equals compares the carried
+// backend IR — including object metadata — and not just the cluster version.
 func TestNewPerClientEnvoyClusters_BackendMetadataUpdateRecomputesDeltas(t *testing.T) {
 	ctx := t.Context()
 	krtopts := krtutil.NewKrtOptions(ctx.Done(), nil)
@@ -258,4 +257,55 @@ func TestNewPerClientEnvoyClusters_ArmedTripwireCatchesBaseMutation(t *testing.T
 	require.True(t, ok, "the tripwire panics with a message, got %T", recovered)
 	assert.Contains(t, msg, backend.ClusterName(), "the tripwire must name the mutated cluster")
 	assert.Contains(t, msg, "mutated after creation")
+}
+
+// TestNewPerClientEnvoyClusters_InlineCLABackendNeverServesTheBase pins the
+// property the previous design enforced with a read-side fence: a base whose
+// CLA is built per client (nil LoadAssignment on an inline-CLA cluster type) is
+// never what a client receives. The override carrying the CLA is built in the
+// same row as the base, so a client either sees the complete per-client cluster
+// or is not yet resolved; a host-less STRICT_DNS cluster cannot leak through.
+func TestNewPerClientEnvoyClusters_InlineCLABackendNeverServesTheBase(t *testing.T) {
+	ctx := t.Context()
+	krtopts := krtutil.NewKrtOptions(ctx.Done(), nil)
+	backendGK := schema.GroupKind{Group: "group", Kind: "kind"}
+
+	translator := &irtranslator.BackendTranslator{
+		ContributedBackends: map[schema.GroupKind]ir.BackendInit{
+			backendGK: {
+				InitEnvoyBackend: func(ctx context.Context, in ir.BackendObjectIR, out *envoyclusterv3.Cluster) *ir.EndpointsForBackend {
+					out.ClusterDiscoveryType = &envoyclusterv3.Cluster_Type{Type: envoyclusterv3.Cluster_STRICT_DNS}
+					eps := ir.NewEndpointsForBackend(in)
+					eps.Add(ir.PodLocality{}, ir.EndpointWithMd{LbEndpoint: lbEndpointPipe("a")})
+					return eps
+				},
+			},
+		},
+		ContributedPolicies: map[schema.GroupKind]sdk.PolicyPlugin{},
+	}
+
+	backend := ir.NewBackendObjectIR(ir.ObjectSource{Group: "group", Kind: "kind", Namespace: "ns", Name: "dns"}, 80, "", "")
+	finalBackends := krt.NewStaticCollection(nil, []*ir.BackendObjectIR{&backend}, krtopts.ToOptions("FinalBackends")...)
+	ucc := ir.NewUniquelyConnectedClient("c", "ns", nil, ir.PodLocality{})
+	uccs := krt.NewStaticCollection(nil, []ir.UniquelyConnectedClient{ucc}, krtopts.ToOptions("UCCs")...)
+
+	pcc := NewPerClientEnvoyClusters(ctx, krtopts, translator, finalBackends, uccs)
+	require.Eventually(t, pcc.HasSynced, time.Second, 10*time.Millisecond)
+
+	var got []uccWithCluster
+	require.Eventually(t, func() bool {
+		var deferral clusterDeferral
+		got, deferral = pcc.FetchClustersForClient(krt.TestingDummyContext{}, ucc)
+		return deferral == deferralNone
+	}, 2*time.Second, 20*time.Millisecond)
+	require.Len(t, got, 1)
+	require.NoError(t, got[0].Error)
+
+	bases := krt.Fetch(krt.TestingDummyContext{}, pcc.base)
+	require.Len(t, bases, 1)
+	require.True(t, bases[0].Base.NeedsInlineCLA(), "fixture must produce a base that needs a per-client CLA")
+	assert.False(t, sharedproto.Same(got[0].Cluster, bases[0].Cluster),
+		"a CLA-less inline-CLA base must never be what a client is served")
+	assert.Len(t, got[0].Cluster.Clone().GetLoadAssignment().GetEndpoints(), 1,
+		"the client must receive the complete per-client cluster with its CLA")
 }
