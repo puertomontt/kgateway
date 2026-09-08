@@ -174,36 +174,45 @@ reference. A cluster renamed during translation would be published under a name 
 reach, so the base transform checks the name and drops that one backend loudly rather than
 publish it silently. Nothing in tree renames it.
 
-#### Client resolution
+#### Clients a row has not evaluated
 
 With the base inside the row there is no cross-collection coherence to check. One question
 remains for a reader: has this row evaluated the client asking? Sparse absence of a delta means
 "no overlay applies" only for a client the row has seen; for any other client it means nothing.
 
-| Fence | Mechanism | What it prevents |
-| --- | --- | --- |
-| Client resolution | `clientInputSnapshot.ContainsCurrent(ucc)` on the snapshot the row points at | reading "no delta" as "no overlay applies" when the client was never evaluated, or was evaluated under a previous identity (`KnowsLocalCluster`, labels) |
+Nothing is withheld over it. The row's overrides are a cache, not the source of truth: a row that
+has not evaluated the requesting client — it just connected, or its identity
+(`KnowsLocalCluster`, labels) changed in place — carries the base and the backend IR its
+overrides were computed from, and `FetchClustersForClient` evaluates the client against exactly
+those, through the same `applyOverlay` the row transform uses. The client receives a complete
+CDS on its first pass. When the row catches up, its override is byte-identical, so the cluster
+version does not move and Envoy sees nothing. A row that never re-evaluated a client would cost
+work, never correctness; there is no state a client can be stuck in.
 
-`FetchClustersForClient` withholds the client's whole CDS when any row fails it, so
-`snapshotPerClient` retains that client's last coherent snapshot until the rows catch up. The
-fence trips only on a client connect or an in-place identity change, and clears once every row
-has re-evaluated against the new client set; a backend change never trips it, because the base
-and its overrides arrive together. The deferral counter and the deferred-clients gauge make both
-the trickle and a stuck client visible.
+The price is that a connect evaluates the new client twice — once in the reader, once in the
+row — and that the reader's result is not interned across clients until the row lands. Both are
+paid only on connect and identity change, which are rare next to backend changes; a backend
+change re-runs exactly one row and is served from it directly. A per-client error the reader
+computes reaches status one propagation later than it reaches CDS, when the row carries it.
 
-The snapshot is shared by pointer across every row of a batch through
-`clientInputSnapshotInterner`, which returns the same pointer for an unchanged client set and a
-new one otherwise, deciding by full UCC equality rather than a hash. `backendClusters.Equals`
-compares that pointer. This is the direction that is safe to get wrong: two snapshots with equal
-membership but different pointers cost one spurious recompute, whereas a stale snapshot retained
-as equal would withhold a client's CDS with no event left to recover it.
+The row's `Backend` and `Base` are inputs, not emitted state, and stay out of its `Equals`: a
+row whose inputs moved without changing any output is kept, so a reader evaluating a new client
+against it may use inputs one propagation behind the base row. That propagation is the same one
+that re-evaluates the row against the client that asked, so the window closes itself.
 
-Readiness is scoped **per requesting client**, not fleet-wide. `FetchClustersForClient` uses
-`krt.PartialFetch` with a projection to `clientClusterView` — the cluster this client is served
-plus the resolution bit — so another client's delta changing, or another client connecting,
-does not retrigger this client's CDS assembly. That is the property that keeps the sparse design
-from reintroducing the fleet-wide barrier of #13868/#14352: unrelated client churn can never
-withhold an established client's CDS.
+The snapshot that records which clients a row evaluated is shared by pointer across every row of
+a batch through `clientInputSnapshotInterner`, which returns the same pointer for an unchanged
+client set and a new one otherwise, deciding by full UCC equality rather than a hash.
+`backendClusters.Equals` compares that pointer. Two snapshots with equal membership but different
+pointers cost one spurious recompute; a stale snapshot retained as equal would serve a
+reconnecting client another identity's cached override until the next event.
+
+Recomputation is scoped **per requesting client**, not fleet-wide. `FetchClustersForClient` uses
+`krt.PartialFetch` with a projection to `clientClusterView` — the cluster this client is served,
+or the row itself while the client is unevaluated — so another client's delta changing, or
+another client connecting, does not retrigger this client's CDS assembly. That is the property
+that keeps the sparse design from reintroducing the fleet-wide barrier of #13868/#14352:
+unrelated client churn can never disturb an established client's CDS.
 
 `baseClusterVersion` folds the inline endpoints hash **and** the attached-policy hash into the
 base proto hash when `SupportsInlineCLA` is true. The per-client CLA is built from
@@ -214,8 +223,8 @@ leave clients pinned to a stale `LoadAssignment` forever. It mirrors what
 so EDS clusters — whose endpoints flow through the separate EDS pipeline — do not churn.
 
 A base that `NeedsInlineCLA` is never what a client receives: `ApplyPerClient` always
-materializes a per-client cluster for it, in the same row as the base, so a client sees either
-the complete cluster or is not yet resolved
+materializes a per-client cluster for it, from the same row as the base — in the row for
+evaluated clients, in the reader for the rest
 (`TestNewPerClientEnvoyClusters_InlineCLABackendNeverServesTheBase`). No read-side rule is
 needed for it.
 
@@ -477,7 +486,7 @@ independently.
 | 4 | #14603 | intern equivalent per-client cluster deltas | no |
 | 5 | #14604 | intern equivalent per-client CLAs, `LoadBalancingContextHash` | no |
 | 6 | #14605 | arm the immutability tripwire in e2e and conformance CI | no |
-| 7 | this PR | fold the base into the overlay row: one linear chain, one fence | **yes** |
+| 7 | this PR | fold the base into the overlay row and evaluate unseen clients in the reader: one linear chain, nothing withheld | **yes** |
 
 PRs 1-2 are shippable before the topology change. PR 2 deliberately keeps dense storage and
 an independently owned proto per row so reviewers can validate the translation contract
@@ -491,9 +500,10 @@ every point in the stack.
 - `backends_test.go` — `baseClusterVersion`: reflects inline-CLA endpoint and policy changes,
   stays stable for EDS endpoint changes, zero for errored bases.
 - `backends_merge_test.go` — resolution of a row for one client: delta-wins, delta error over
-  base error, client filtering, base and overrides move together, waits for the current client
-  set, waits for the current local-cluster capability, unrelated client churn is *not* a
-  readiness barrier, and each deferral reason is reported by name.
+  base error, client filtering, base and overrides move together, an unevaluated client is
+  served on the first pass with the version the row will later carry, an in-place identity
+  change is evaluated against the new identity, and unrelated client churn is *not* a
+  readiness barrier.
 - `backend_overlay_test.go`, `backend_validation_test.go` — overlay gathering, deterministic
   ordering, locality-default undo, strict-mode validation of overlay output.
 - `prioritize_test.go` — the CLA is byte-stable across repeated calls in all three priority
@@ -538,15 +548,23 @@ controller panic instead of a silent cross-client leak.
 `deltas` driven off `finalBackends`, fetching the base by key, with the reader fenced on a
 `BaseFingerprint` stored in the delta set. Correct, but every backend change reached the reader
 twice — once with a stale delta set (deferred) and once with the matching one — and five
-distinct fences, a snapshot generation counter and a fleet fingerprint existed only to make the
-join safe. Folding the base into the delta row (PR 7) deletes all of that and leaves one fence.
+distinct fences, a snapshot generation counter, a fleet fingerprint and two deferral metrics
+existed only to make the join safe. Folding the base into the delta row (PR 7) deletes all of
+that.
+
+**Withhold a client the row has not evaluated.** The intermediate form of PR 7: one fence left,
+tripping only on connect and identity change, with a counter and a stuck-client gauge to watch
+it. Rejected because it still left one state a client could be stuck in if a row ever failed to
+re-evaluate, and because the reader already had every input needed to evaluate the client
+itself, at the cost of doing that work twice on connect.
 
 **Client-keyed overlay evaluation.** One collection keyed by client that fetches every base and
-runs `ApplyPerClient` inline; no fence of any kind, and a connecting client is served in one
-pass. Rejected because backend changes dominate client churn in production: every backend edit
-would re-run `ApplyPerClient` for every (client, backend) pair, and rebuild every
-client-dependent inline CLA, instead of the edited backend's overlays alone. The backend-keyed
-row keeps overlay evaluation local to the backend that changed.
+runs `ApplyPerClient` inline for every backend; no per-backend row, no cache, no merge. Rejected
+because backend changes dominate client churn in production: every backend edit would re-run
+`ApplyPerClient` for every (client, backend) pair, and rebuild every client-dependent inline
+CLA, instead of the edited backend's overlays alone. A KRT transform cannot memoize part of
+itself; the backend-keyed row is that memo, with dependency tracking for free, and PR 7's reader
+falls back to exactly this client-keyed evaluation only for the pairs the memo has not seen.
 
 **Keep dense storage, share only the base translation.** This is exactly PR 2 of the stack,
 and it captures most of the CPU win with none of the synchronization risk. It was rejected as
@@ -566,7 +584,7 @@ beat proves user-visible.
 
 **A KRT collection between UCC events and delta recomputation** (rather than the
 `clientInputSnapshotInterner`). Cleaner dependency graph, but it adds a propagation hop
-between a client connecting and its deltas existing, lengthening the one deferral that remains.
+between a client connecting and its deltas existing, during which the reader does the row's work.
 
 **Hash-free equality (`proto.Equal` on stored clusters).** Correct by construction, but
 `Equals` runs on every recompute for every row; a content hash computed once at store time is
@@ -578,10 +596,13 @@ that makes it sound.
 **A newly connected ambient client can see the un-overlaid base for one KRT propagation
 beat** before its waypoint delta is computed: in a sparse design, absence of a delta is
 indistinguishable from not-yet-computed. The deterministic half — 503s from CLA-less inline
-clusters — cannot occur: the CLA-bearing override is built in the same row as the base, so the
-client-resolution fence covers it. Closing the waypoint beat needs
-a per-UCC computed marker, and naive whole-publish deferral is riskier than the beat. Needs a
-follow-up issue.
+clusters — cannot occur: the CLA-bearing override is built from the same row as the base, by
+the reader if the row has not evaluated the client yet. The waypoint beat likewise closes: an
+ambient client that connects is evaluated against the waypoint overlay on its first pass rather
+than served the base. What remains is narrower: a reader evaluating a new client may use row
+inputs one propagation behind the base row, which the same propagation corrects. Closing even
+that would mean comparing the row's inputs in its `Equals`, re-running every client on every
+input-only change; not worth it unless the window proves user-visible.
 
 **The recompute fan-out on client churn is unchanged.** The overlay transform `Fetch`es the whole
 UCC collection, so any connect or disconnect re-runs it for every backend, and each run loops

@@ -1,6 +1,7 @@
 package proxy_syncer
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -8,8 +9,11 @@ import (
 	envoyclusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	"github.com/stretchr/testify/require"
 	"istio.io/istio/pkg/kube/krt"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/kgateway-dev/kgateway/v2/pkg/kgateway/proxy_syncer/sharedproto"
+	"github.com/kgateway-dev/kgateway/v2/pkg/kgateway/translator/irtranslator"
+	sdk "github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk"
 	"github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/ir"
 )
 
@@ -28,6 +32,59 @@ func uccWithClusterByName(got []uccWithCluster) map[string]uccWithCluster {
 func waitSynced(t *testing.T, pcc PerClientEnvoyClusters) {
 	t.Helper()
 	require.Eventually(t, pcc.HasSynced, time.Second, 10*time.Millisecond)
+}
+
+// altStatNameOverlayTranslator returns a translator whose only overlay sets
+// AltStatName to mark for clients that applies accepts, and declines the rest.
+func altStatNameOverlayTranslator(mark string, applies func(ir.UniquelyConnectedClient) bool) *irtranslator.BackendTranslator {
+	return &irtranslator.BackendTranslator{
+		ContributedPolicies: map[schema.GroupKind]sdk.PolicyPlugin{
+			{Group: "test", Kind: "Overlay"}: {
+				PerClientClusterOverlay: func(_ krt.HandlerContext, _ context.Context, ucc ir.UniquelyConnectedClient, _ ir.BackendObjectIR) *sdk.ClusterOverlay {
+					if !applies(ucc) {
+						return nil
+					}
+					return &sdk.ClusterOverlay{Mutate: func(out *envoyclusterv3.Cluster) {
+						out.AltStatName = mark
+					}}
+				},
+			},
+		},
+	}
+}
+
+// evaluableBase is a base row that carries the inputs a reader needs to
+// evaluate a client itself: a non-errored Base and a backend IR.
+func evaluableBase(name string, cluster *envoyclusterv3.Cluster, version uint64) baseEnvoyCluster {
+	backend := ir.NewBackendObjectIR(ir.ObjectSource{Namespace: "ns", Name: name}, 80, "", "")
+	return baseEnvoyCluster{
+		Name:           name,
+		Cluster:        sharedproto.Wrap(cluster),
+		ClusterVersion: version,
+		Backend:        &backend,
+		Base:           &irtranslator.BaseCluster{},
+	}
+}
+
+func rowFromBase(b baseEnvoyCluster, clients *clientInputSnapshot, deltas ...uccClusterDelta) backendClusters {
+	row := backendClusters{
+		Name:              b.Name,
+		Cluster:           b.Cluster,
+		ClusterVersion:    b.ClusterVersion,
+		Error:             b.Error,
+		BackendSource:     b.BackendSource,
+		BackendGeneration: b.BackendGeneration,
+		Clients:           clients,
+		Backend:           b.Backend,
+		Base:              b.Base,
+	}
+	for _, d := range deltas {
+		if row.Deltas == nil {
+			row.Deltas = make(map[string]uccClusterDelta)
+		}
+		row.Deltas[d.Client.ResourceName()] = d
+	}
+	return row
 }
 
 // TestFetchClustersForClient_Merge exercises resolution of a row for one client:
@@ -51,9 +108,7 @@ func TestFetchClustersForClient_Merge(t *testing.T) {
 	pcc := newTestPerClientClustersRaw(bases, deltas, ucc)
 	waitSynced(t, pcc)
 
-	rows, deferral := pcc.FetchClustersForClient(krt.TestingDummyContext{}, ucc)
-	require.Equal(t, deferralNone, deferral, "a fully evaluated client must not report a deferral")
-	got := uccWithClusterByName(rows)
+	got := uccWithClusterByName(pcc.FetchClustersForClient(krt.TestingDummyContext{}, ucc))
 	require.Len(t, got, 2)
 
 	// base with no override passes through unchanged
@@ -79,7 +134,7 @@ func TestFetchClustersForClient_DeltaErrorWinsOverBaseError(t *testing.T) {
 	pcc := newTestPerClientClustersRaw(bases, deltas, ucc)
 	waitSynced(t, pcc)
 
-	got, _ := pcc.FetchClustersForClient(krt.TestingDummyContext{}, ucc)
+	got := pcc.FetchClustersForClient(krt.TestingDummyContext{}, ucc)
 	require.Len(t, got, 1)
 	require.Equal(t, deltaErr, got[0].Error, "override error should win over base error")
 }
@@ -99,12 +154,12 @@ func TestFetchClustersForClient_FiltersByClient(t *testing.T) {
 	waitSynced(t, pcc)
 
 	// uccA sees its override
-	gotA, _ := pcc.FetchClustersForClient(krt.TestingDummyContext{}, uccA)
+	gotA := pcc.FetchClustersForClient(krt.TestingDummyContext{}, uccA)
 	require.Len(t, gotA, 1)
 	require.Equal(t, uint64(50), gotA[0].ClusterVersion)
 
 	// uccB has no override, sees the shared base proto
-	gotB, _ := pcc.FetchClustersForClient(krt.TestingDummyContext{}, uccB)
+	gotB := pcc.FetchClustersForClient(krt.TestingDummyContext{}, uccB)
 	require.Len(t, gotB, 1)
 	require.True(t, gotB[0].Cluster.Is(base), "client without an override must alias the shared base proto")
 	require.Equal(t, uint64(1), gotB[0].ClusterVersion)
@@ -129,11 +184,10 @@ func TestFetchClustersForClient_BaseAndOverridesMoveTogether(t *testing.T) {
 			ucc.ResourceName(): {Client: ucc, Name: "c", Cluster: sharedproto.Wrap(oldDelta), ClusterVersion: 99},
 		},
 	}})
-	pcc := PerClientEnvoyClusters{clusters: clusterCol}
+	pcc := testPerClientClusters(clusterCol, clustersTestTranslator())
 	waitSynced(t, pcc)
 
-	got, deferral := pcc.FetchClustersForClient(krt.TestingDummyContext{}, ucc)
-	require.Equal(t, deferralNone, deferral)
+	got := pcc.FetchClustersForClient(krt.TestingDummyContext{}, ucc)
 	require.Len(t, got, 1)
 	require.True(t, got[0].Cluster.Is(oldDelta))
 
@@ -146,7 +200,7 @@ func TestFetchClustersForClient_BaseAndOverridesMoveTogether(t *testing.T) {
 		Clients:        clientSnapshot,
 	})
 	require.Eventually(t, func() bool {
-		got, _ := pcc.FetchClustersForClient(krt.TestingDummyContext{}, ucc)
+		got := pcc.FetchClustersForClient(krt.TestingDummyContext{}, ucc)
 		return len(got) == 1 && got[0].Cluster.Is(newBase) && got[0].ClusterVersion == 2
 	}, time.Second, 10*time.Millisecond)
 
@@ -161,136 +215,116 @@ func TestFetchClustersForClient_BaseAndOverridesMoveTogether(t *testing.T) {
 		},
 	})
 	require.Eventually(t, func() bool {
-		got, _ := pcc.FetchClustersForClient(krt.TestingDummyContext{}, ucc)
+		got := pcc.FetchClustersForClient(krt.TestingDummyContext{}, ucc)
 		return len(got) == 1 && got[0].Cluster.Is(newDelta) && got[0].ClusterVersion == 100
 	}, time.Second, 10*time.Millisecond)
 }
 
-// TestFetchClustersForClient_WaitsForCurrentClientSet proves that an empty
-// sparse result from before a client connected is pending, not an affirmative
-// "no overlay" decision for that client.
-func TestFetchClustersForClient_WaitsForCurrentClientSet(t *testing.T) {
-	ucc := ir.NewUniquelyConnectedClient("role", "ns", nil, ir.PodLocality{})
-	base := clusterNamed("c")
-	clusterCol := krt.NewStaticCollection(nil, []backendClusters{{
-		Name: "c", Cluster: sharedproto.Wrap(base), ClusterVersion: 1, Clients: newClientInputSnapshot(nil),
-	}})
-	pcc := PerClientEnvoyClusters{clusters: clusterCol}
+// TestFetchClustersForClient_UnevaluatedClientIsServedOnFirstPass pins the
+// property that replaced the client-resolution fence: a client the row has not
+// evaluated is evaluated by the reader, from the row's own base and inputs, and
+// receives its complete cluster immediately rather than nothing. When the row
+// catches up, its override is byte-identical, so the version does not move.
+func TestFetchClustersForClient_UnevaluatedClientIsServedOnFirstPass(t *testing.T) {
+	ucc := ir.NewUniquelyConnectedClient("role", "ns", map[string]string{"match": "yes"}, ir.PodLocality{})
+	translator := altStatNameOverlayTranslator("overlaid", func(c ir.UniquelyConnectedClient) bool {
+		return c.Labels["match"] == "yes"
+	})
+	base := evaluableBase("c", clusterNamed("c"), 1)
+	clusterCol := krt.NewStaticCollection(nil, []backendClusters{rowFromBase(base, newClientInputSnapshot(nil))})
+	pcc := testPerClientClusters(clusterCol, translator)
 	waitSynced(t, pcc)
 
-	rows, deferral := pcc.FetchClustersForClient(krt.TestingDummyContext{}, ucc)
-	require.Empty(t, rows)
-	require.Equal(t, deferralUnresolvedClient, deferral)
+	got := pcc.FetchClustersForClient(krt.TestingDummyContext{}, ucc)
+	require.Len(t, got, 1, "a client the row has not evaluated must still be served")
+	require.NoError(t, got[0].Error)
+	require.Equal(t, "overlaid", got[0].Cluster.Clone().GetAltStatName(),
+		"the reader must apply the overlay itself, not fall back to the base")
+	inlineVersion := got[0].ClusterVersion
+	require.NotEqual(t, base.ClusterVersion, inlineVersion)
 
-	clusterCol.UpdateObject(backendClusters{
-		Name: "c", Cluster: sharedproto.Wrap(base), ClusterVersion: 1,
-		Clients: newClientInputSnapshot([]ir.UniquelyConnectedClient{ucc}),
-	})
+	// The row catches up with the connected client and carries the override
+	// it computed for it; the reader now serves that and the version is stable.
+	perClient := clusterNamed("c")
+	perClient.AltStatName = "overlaid"
+	rowDelta := uccClusterDelta{Client: ucc, Name: "c", Cluster: sharedproto.Wrap(perClient), ClusterVersion: inlineVersion}
+	clusterCol.UpdateObject(rowFromBase(base, newClientInputSnapshot([]ir.UniquelyConnectedClient{ucc}), rowDelta))
 	require.Eventually(t, func() bool {
-		got, _ := pcc.FetchClustersForClient(krt.TestingDummyContext{}, ucc)
-		return len(got) == 1 && got[0].Cluster.Is(base)
-	}, time.Second, 10*time.Millisecond)
+		got := pcc.FetchClustersForClient(krt.TestingDummyContext{}, ucc)
+		return len(got) == 1 && got[0].Cluster.Is(perClient)
+	}, time.Second, 10*time.Millisecond, "once the row has evaluated the client, its override must be served")
+	require.Equal(t, inlineVersion, pcc.FetchClustersForClient(krt.TestingDummyContext{}, ucc)[0].ClusterVersion,
+		"the reader's own evaluation and the row's must agree on the version")
 }
 
 // TestFetchClustersForClient_UnrelatedClientChurnIsNotAReadinessBarrier proves
-// that an established client can keep using a backend row evaluated before
-// another client connected. The old snapshot is authoritative for the stable
-// client because it contains that client's exact current inputs; only the new
-// client must wait for this backend to evaluate it.
+// that an established client keeps using a backend row evaluated before another
+// client connected, and that the late client is served too — from the reader's
+// own evaluation — rather than waiting for the row.
 func TestFetchClustersForClient_UnrelatedClientChurnIsNotAReadinessBarrier(t *testing.T) {
 	stable := ir.NewUniquelyConnectedClient("stable", "ns", nil, ir.PodLocality{})
 	late := ir.NewUniquelyConnectedClient("late", "ns", nil, ir.PodLocality{})
-	base := clusterNamed("c")
+	base := evaluableBase("c", clusterNamed("c"), 1)
 
-	clusterCol := krt.NewStaticCollection(nil, []backendClusters{{
-		Name: "c", Cluster: sharedproto.Wrap(base), ClusterVersion: 1,
-		Clients: newClientInputSnapshot([]ir.UniquelyConnectedClient{stable}),
-	}})
-	pcc := PerClientEnvoyClusters{clusters: clusterCol}
+	clusterCol := krt.NewStaticCollection(nil, []backendClusters{
+		rowFromBase(base, newClientInputSnapshot([]ir.UniquelyConnectedClient{stable})),
+	})
+	pcc := testPerClientClusters(clusterCol, clustersTestTranslator())
 	waitSynced(t, pcc)
 
-	stableClusters, _ := pcc.FetchClustersForClient(krt.TestingDummyContext{}, stable)
-	require.Len(t, stableClusters, 1, "unrelated client addition must not defer the established client")
-	require.True(t, stableClusters[0].Cluster.Is(base))
-	lateClusters, deferral := pcc.FetchClustersForClient(krt.TestingDummyContext{}, late)
-	require.Empty(t, lateClusters, "the newly connected client must wait until this backend evaluates it")
-	require.Equal(t, deferralUnresolvedClient, deferral)
+	stableClusters := pcc.FetchClustersForClient(krt.TestingDummyContext{}, stable)
+	require.Len(t, stableClusters, 1, "unrelated client addition must not disturb the established client")
+	require.True(t, stableClusters[0].Cluster.Is(base.Cluster.BorrowForRead()))
+	lateClusters := pcc.FetchClustersForClient(krt.TestingDummyContext{}, late)
+	require.Len(t, lateClusters, 1, "the newly connected client must be served without waiting for the row")
+	require.True(t, lateClusters[0].Cluster.Is(base.Cluster.BorrowForRead()),
+		"with no overlay applying, the reader serves the shared base proto itself")
 }
 
-// TestFetchClustersForClient_WaitsForCurrentLocalClusterCapability proves that
-// an empty sparse result from before a client advertised local-cluster support
-// is pending, not an affirmative "no overlay" decision for the changed client.
-func TestFetchClustersForClient_WaitsForCurrentLocalClusterCapability(t *testing.T) {
+// TestFetchClustersForClient_IdentityChangeIsEvaluatedAgainstTheNewIdentity
+// proves that an override built for a previous version of the client is not
+// served to the current one: the row's snapshot holds the old identity, so the
+// reader evaluates the current identity itself and gets the current answer.
+func TestFetchClustersForClient_IdentityChangeIsEvaluatedAgainstTheNewIdentity(t *testing.T) {
 	oldUcc := ir.NewUniquelyConnectedClient("role", "ns", nil, ir.PodLocality{})
 	currentUcc := oldUcc
 	currentUcc.KnowsLocalCluster = true
-	stable := ir.NewUniquelyConnectedClient("stable", "ns", nil, ir.PodLocality{})
+	translator := altStatNameOverlayTranslator("local-cluster-capable", func(c ir.UniquelyConnectedClient) bool {
+		return c.KnowsLocalCluster
+	})
+	base := evaluableBase("c", clusterNamed("c"), 1)
 
-	base := clusterNamed("c")
-	clusterCol := krt.NewStaticCollection(nil, []backendClusters{{
-		Name: "c", Cluster: sharedproto.Wrap(base), ClusterVersion: 1,
-		Clients: newClientInputSnapshot([]ir.UniquelyConnectedClient{oldUcc, stable}),
-	}})
-	pcc := PerClientEnvoyClusters{clusters: clusterCol}
+	// Row evaluated the old identity, for which no overlay applied.
+	clusterCol := krt.NewStaticCollection(nil, []backendClusters{
+		rowFromBase(base, newClientInputSnapshot([]ir.UniquelyConnectedClient{oldUcc})),
+	})
+	pcc := testPerClientClusters(clusterCol, translator)
 	waitSynced(t, pcc)
 
-	rows, deferral := pcc.FetchClustersForClient(krt.TestingDummyContext{}, currentUcc)
-	require.Empty(t, rows)
-	require.Equal(t, deferralUnresolvedClient, deferral,
-		"a client whose non-key field changed is unresolved by the old snapshot")
-	stableClusters, _ := pcc.FetchClustersForClient(krt.TestingDummyContext{}, stable)
-	require.Len(t, stableClusters, 1, "another client's capability transition must not defer the stable client")
-	require.True(t, stableClusters[0].Cluster.Is(base))
+	got := pcc.FetchClustersForClient(krt.TestingDummyContext{}, currentUcc)
+	require.Len(t, got, 1)
+	require.Equal(t, "local-cluster-capable", got[0].Cluster.Clone().GetAltStatName(),
+		"the current identity must be evaluated, not read off the stale snapshot")
 
-	clusterCol.UpdateObject(backendClusters{
-		Name: "c", Cluster: sharedproto.Wrap(base), ClusterVersion: 1,
-		Clients: newClientInputSnapshot([]ir.UniquelyConnectedClient{currentUcc, stable}),
-	})
-	require.Eventually(t, func() bool {
-		got, _ := pcc.FetchClustersForClient(krt.TestingDummyContext{}, currentUcc)
-		return len(got) == 1 && got[0].Cluster.Is(base)
-	}, time.Second, 10*time.Millisecond)
+	// And the other direction: the row holds an override for the old identity
+	// that must not be served to the current one.
+	stale := clusterNamed("c")
+	stale.AltStatName = "local-cluster-capable"
+	clusterCol.UpdateObject(rowFromBase(base, newClientInputSnapshot([]ir.UniquelyConnectedClient{currentUcc}),
+		uccClusterDelta{Client: currentUcc, Name: "c", Cluster: sharedproto.Wrap(stale), ClusterVersion: 7}))
+	waitSynced(t, pcc)
+	got = pcc.FetchClustersForClient(krt.TestingDummyContext{}, oldUcc)
+	require.Len(t, got, 1)
+	require.True(t, got[0].Cluster.Is(base.Cluster.BorrowForRead()),
+		"an override built for another identity of this client must not be served")
 }
 
-// TestFetchClustersForClient_NamesTheFenceThatFailed covers the deferral reasons
-// the scenario tests above do not reach. The reason is what the deferral counter
-// is labelled by, so each fence must report its own name and nothing else.
-func TestFetchClustersForClient_NamesTheFenceThatFailed(t *testing.T) {
+// TestFetchClustersForClient_NoRowsReturnsNothing covers the one case the
+// reader has nothing to say: no backend rows at all.
+func TestFetchClustersForClient_NoRowsReturnsNothing(t *testing.T) {
 	ucc := ir.NewUniquelyConnectedClient("role", "ns", nil, ir.PodLocality{})
-	base := clusterNamed("c")
-
-	t.Run("no backends", func(t *testing.T) {
-		pcc := newTestPerClientClustersRaw(nil, nil, ucc)
-		waitSynced(t, pcc)
-		rows, deferral := pcc.FetchClustersForClient(krt.TestingDummyContext{}, ucc)
-		require.Empty(t, rows)
-		require.Equal(t, deferralNoBackends, deferral)
-	})
-
-	t.Run("zero value", func(t *testing.T) {
-		pcc := PerClientEnvoyClusters{}
-		rows, deferral := pcc.FetchClustersForClient(krt.TestingDummyContext{}, ucc)
-		require.Empty(t, rows)
-		require.Equal(t, deferralNoBackends, deferral)
-	})
-
-	// An override built for a previous version of the client is not proof the
-	// current version was evaluated: the row's snapshot holds the old identity,
-	// so the client is unresolved, exactly as if it had no override at all.
-	t.Run("override built for an older version of the client", func(t *testing.T) {
-		older := ucc
-		older.KnowsLocalCluster = true
-		clusterCol := krt.NewStaticCollection(nil, []backendClusters{{
-			Name: "c", Cluster: sharedproto.Wrap(base), ClusterVersion: 1,
-			Clients: newClientInputSnapshot([]ir.UniquelyConnectedClient{older}),
-			Deltas: map[string]uccClusterDelta{
-				ucc.ResourceName(): {Client: older, Name: "c", Cluster: sharedproto.Wrap(clusterNamed("c")), ClusterVersion: 2},
-			},
-		}})
-		pcc := PerClientEnvoyClusters{clusters: clusterCol}
-		waitSynced(t, pcc)
-		rows, deferral := pcc.FetchClustersForClient(krt.TestingDummyContext{}, ucc)
-		require.Empty(t, rows)
-		require.Equal(t, deferralUnresolvedClient, deferral)
-	})
+	pcc := newTestPerClientClustersRaw(nil, nil, ucc)
+	waitSynced(t, pcc)
+	require.Empty(t, pcc.FetchClustersForClient(krt.TestingDummyContext{}, ucc))
+	require.Empty(t, (&PerClientEnvoyClusters{}).FetchClustersForClient(krt.TestingDummyContext{}, ucc))
 }

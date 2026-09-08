@@ -84,9 +84,9 @@ func TestNewPerClientEnvoyClusters_SparseOverlayWiring(t *testing.T) {
 
 	var gotA, gotB, gotOther []uccWithCluster
 	require.Eventually(t, func() bool {
-		gotA, _ = pcc.FetchClustersForClient(krt.TestingDummyContext{}, matchA)
-		gotB, _ = pcc.FetchClustersForClient(krt.TestingDummyContext{}, matchB)
-		gotOther, _ = pcc.FetchClustersForClient(krt.TestingDummyContext{}, other)
+		gotA = pcc.FetchClustersForClient(krt.TestingDummyContext{}, matchA)
+		gotB = pcc.FetchClustersForClient(krt.TestingDummyContext{}, matchB)
+		gotOther = pcc.FetchClustersForClient(krt.TestingDummyContext{}, other)
 		return len(gotA) == 1 && len(gotB) == 1 && len(gotOther) == 1
 	}, 2*time.Second, 20*time.Millisecond)
 
@@ -166,7 +166,7 @@ func TestNewPerClientEnvoyClusters_BackendMetadataUpdateRecomputesDeltas(t *test
 	require.Eventually(t, pcc.HasSynced, time.Second, 10*time.Millisecond)
 
 	require.Eventually(t, func() bool {
-		got, _ := pcc.FetchClustersForClient(krt.TestingDummyContext{}, ucc)
+		got := pcc.FetchClustersForClient(krt.TestingDummyContext{}, ucc)
 		return len(got) == 1 && got[0].Cluster.Clone().GetOutlierDetection() == nil
 	}, 2*time.Second, 20*time.Millisecond)
 
@@ -182,7 +182,7 @@ func TestNewPerClientEnvoyClusters_BackendMetadataUpdateRecomputesDeltas(t *test
 	finalBackends.UpdateObject(&updated)
 
 	require.Eventually(t, func() bool {
-		got, _ := pcc.FetchClustersForClient(krt.TestingDummyContext{}, ucc)
+		got := pcc.FetchClustersForClient(krt.TestingDummyContext{}, ucc)
 		return len(got) == 1 && got[0].Cluster.Clone().GetOutlierDetection() != nil
 	}, 2*time.Second, 20*time.Millisecond)
 
@@ -197,7 +197,7 @@ func TestNewPerClientEnvoyClusters_BackendMetadataUpdateRecomputesDeltas(t *test
 	finalBackends.UpdateObject(&removed)
 
 	require.Eventually(t, func() bool {
-		got, _ := pcc.FetchClustersForClient(krt.TestingDummyContext{}, ucc)
+		got := pcc.FetchClustersForClient(krt.TestingDummyContext{}, ucc)
 		return len(got) == 1 && got[0].Cluster.Clone().GetOutlierDetection() == nil
 	}, 2*time.Second, 20*time.Millisecond)
 }
@@ -236,7 +236,7 @@ func TestNewPerClientEnvoyClusters_ArmedTripwireCatchesBaseMutation(t *testing.T
 	pcc := NewPerClientEnvoyClusters(ctx, krtopts, translator, finalBackends, uccs)
 	var got []uccWithCluster
 	require.Eventually(t, func() bool {
-		got, _ = pcc.FetchClustersForClient(krt.TestingDummyContext{}, ucc)
+		got = pcc.FetchClustersForClient(krt.TestingDummyContext{}, ucc)
 		return len(got) == 1
 	}, 2*time.Second, 20*time.Millisecond)
 
@@ -262,9 +262,9 @@ func TestNewPerClientEnvoyClusters_ArmedTripwireCatchesBaseMutation(t *testing.T
 // TestNewPerClientEnvoyClusters_InlineCLABackendNeverServesTheBase pins the
 // property the previous design enforced with a read-side fence: a base whose
 // CLA is built per client (nil LoadAssignment on an inline-CLA cluster type) is
-// never what a client receives. The override carrying the CLA is built in the
-// same row as the base, so a client either sees the complete per-client cluster
-// or is not yet resolved; a host-less STRICT_DNS cluster cannot leak through.
+// never what a client receives. The override carrying the CLA is built from the
+// same row as the base — by the row for evaluated clients, by the reader for
+// the rest — so a host-less STRICT_DNS cluster cannot leak through.
 func TestNewPerClientEnvoyClusters_InlineCLABackendNeverServesTheBase(t *testing.T) {
 	ctx := t.Context()
 	krtopts := krtutil.NewKrtOptions(ctx.Done(), nil)
@@ -294,11 +294,9 @@ func TestNewPerClientEnvoyClusters_InlineCLABackendNeverServesTheBase(t *testing
 
 	var got []uccWithCluster
 	require.Eventually(t, func() bool {
-		var deferral clusterDeferral
-		got, deferral = pcc.FetchClustersForClient(krt.TestingDummyContext{}, ucc)
-		return deferral == deferralNone
+		got = pcc.FetchClustersForClient(krt.TestingDummyContext{}, ucc)
+		return len(got) == 1
 	}, 2*time.Second, 20*time.Millisecond)
-	require.Len(t, got, 1)
 	require.NoError(t, got[0].Error)
 
 	bases := krt.Fetch(krt.TestingDummyContext{}, pcc.base)

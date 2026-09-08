@@ -58,7 +58,7 @@ func clustersTestClient(role string) ir.UniquelyConnectedClient {
 }
 
 func clusterNamesForClient(c PerClientEnvoyClusters, ucc ir.UniquelyConnectedClient) []string {
-	fetched, _ := c.FetchClustersForClient(krt.TestingDummyContext{}, ucc)
+	fetched := c.FetchClustersForClient(krt.TestingDummyContext{}, ucc)
 	names := make([]string, 0, len(fetched))
 	for _, f := range fetched {
 		names = append(names, f.Name)
@@ -81,6 +81,30 @@ func newClustersTestFixture(
 	finalBackends := krt.NewStaticCollection(nil, backends, krtopts.ToOptions("FinalBackends")...)
 	clusters := NewPerClientEnvoyClusters(ctx, krtopts, clustersTestTranslator(), finalBackends, uccs)
 	return uccs, finalBackends, clusters
+}
+
+// rowsEvaluated reports whether every backend row has evaluated ucc — that is,
+// whether the row cache has caught up with the client set. FetchClustersForClient
+// serves a client either way; this is how tests observe the rows themselves.
+func rowsEvaluated(c PerClientEnvoyClusters, ucc ir.UniquelyConnectedClient) bool {
+	rows := c.clusters.List()
+	if len(rows) == 0 {
+		return false
+	}
+	for _, row := range rows {
+		if !row.Clients.ContainsCurrent(ucc) {
+			return false
+		}
+	}
+	return true
+}
+
+func eventuallyRowsEvaluated(t *testing.T, c PerClientEnvoyClusters, ucc ir.UniquelyConnectedClient, want bool) {
+	t.Helper()
+	require.Eventuallyf(t, func() bool {
+		return rowsEvaluated(c, ucc) == want
+	}, 5*time.Second, 10*time.Millisecond,
+		"rows never reached evaluated=%v for client %q", want, ucc.ResourceName())
 }
 
 func eventuallyClusterCount(t *testing.T, c PerClientEnvoyClusters, ucc ir.UniquelyConnectedClient, want int) {
@@ -133,9 +157,9 @@ func TestPerClientClusters_BackendAddedPropagatesToAllClients(t *testing.T) {
 	eventuallyClusterCount(t, clusters, b, 2)
 }
 
-// Removing a client leaves other clients untouched and clears the removed
-// client's resolved view. Treating an absent client as resolved against shared
-// bases would make sparse delta absence ambiguous during reconnect.
+// Removing a client leaves other clients untouched and drops the removed client
+// from every row's evaluated set, so its cached overrides cannot be served to a
+// reconnecting client with a different identity.
 func TestPerClientClusters_ClientRemovedLeavesOthersUnaffected(t *testing.T) {
 	a, b := clustersTestClient("role-a"), clustersTestClient("role-b")
 	uccs, _, clusters := newClustersTestFixture(t,
@@ -148,8 +172,8 @@ func TestPerClientClusters_ClientRemovedLeavesOthersUnaffected(t *testing.T) {
 	uccs.DeleteObject(b.ResourceName())
 	// The surviving client keeps its full set...
 	eventuallyClusterCount(t, clusters, a, 2)
-	// ...while the disconnected client no longer has a resolved generation.
-	eventuallyClusterCount(t, clusters, b, 0)
+	// ...while the rows forget the disconnected client.
+	eventuallyRowsEvaluated(t, clusters, b, false)
 }
 
 // Each client's index entry returns only that client's clusters.
@@ -160,11 +184,11 @@ func TestPerClientClusters_IndexIsolation(t *testing.T) {
 		[]*ir.BackendObjectIR{clustersTestBackend("b1"), clustersTestBackend("b2")},
 	)
 	eventuallyClusterCount(t, clusters, a, 2)
-	rowsA, _ := clusters.FetchClustersForClient(krt.TestingDummyContext{}, a)
+	rowsA := clusters.FetchClustersForClient(krt.TestingDummyContext{}, a)
 	for _, fc := range rowsA {
 		require.Equal(t, a.ResourceName(), fc.Client.ResourceName(), "index leaked another client's row into client a")
 	}
-	rowsB, _ := clusters.FetchClustersForClient(krt.TestingDummyContext{}, b)
+	rowsB := clusters.FetchClustersForClient(krt.TestingDummyContext{}, b)
 	for _, fc := range rowsB {
 		require.Equal(t, b.ResourceName(), fc.Client.ResourceName(), "index leaked another client's row into client b")
 	}
@@ -181,11 +205,13 @@ func TestPerClientClusters_ReAddClientKeepsRows(t *testing.T) {
 		[]*ir.BackendObjectIR{clustersTestBackend("b1"), clustersTestBackend("b2")},
 	)
 	eventuallyClusterCount(t, clusters, b, 2)
+	eventuallyRowsEvaluated(t, clusters, b, true)
 	uccs.DeleteObject(b.ResourceName())
 	// Observe the disconnect before reconnecting, so the delete and the re-add
 	// cannot coalesce into a no-op and skip the reconnect path under test.
-	eventuallyClusterCount(t, clusters, b, 0)
+	eventuallyRowsEvaluated(t, clusters, b, false)
 	uccs.UpdateObject(b)
+	eventuallyRowsEvaluated(t, clusters, b, true)
 	eventuallyClusterCount(t, clusters, b, 2)
 	eventuallyClusterCount(t, clusters, a, 2)
 }

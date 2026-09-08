@@ -86,16 +86,12 @@ func snapshotPerClient(
 	extraEndpointCollections ...PerClientEnvoyEndpoints,
 ) krt.Collection[XdsSnapWrapper] {
 	clusterSnapshot := krt.NewCollection(uccCol, func(kctx krt.HandlerContext, ucc ir.UniquelyConnectedClient) *clustersWithErrors {
-		clustersForUcc, deferral := clusters.FetchClustersForClient(kctx, ucc)
-		if deferral != deferralNone {
-			// Expected when a client connects or changes identity in place,
-			// while the backend rows re-evaluate against the new client set
-			// (see FetchClustersForClient), so this is Debug. The counter
-			// carries the reason; a client that stays here shows on the
-			// deferred-clients gauge.
-			recordClusterDeferral(ucc.ResourceName(), deferral)
-			logger.Debug("no perclient clusters; defer building snapshot",
-				"client", ucc.ResourceName(), "reason", deferral)
+		clustersForUcc := clusters.FetchClustersForClient(kctx, ucc)
+		if len(clustersForUcc) == 0 {
+			// No backend rows at all. Unreachable in a real cluster, where
+			// kubernetes.default alone is a backend; common in tests and during
+			// the first moments after start, before any backend has translated.
+			logger.Debug("no perclient clusters; defer building snapshot", "client", ucc.ResourceName())
 			return nil
 		}
 		logger.Debug("found perclient clusters", "client", ucc.ResourceName(), "clusters", len(clustersForUcc))
@@ -133,7 +129,6 @@ func snapshotPerClient(
 			resourceName:        ucc.ResourceName(),
 		}
 	}, krtopts.ToOptions("ClusterResources")...)
-	trackDeferredClients(uccCol, clusterSnapshot)
 
 	endpointResources := krt.NewCollection(uccCol, func(kctx krt.HandlerContext, ucc ir.UniquelyConnectedClient) *endpointsWithUccName {
 		endpointsForUcc := endpoints.FetchEndpointsForClient(kctx, ucc)
@@ -187,9 +182,8 @@ func snapshotPerClient(
 		// pkg/krtcollections/uniqueclients.go keeps a client's first watch
 		// from observing that convergence window.
 		//
-		// Debug rather than Info: a cluster-row deferral upstream deletes that
-		// client's row and lands here on every client connect, so at fleet
-		// scale this line would otherwise drown the signal it exists for.
+		// Debug rather than Info: this fires on every client connect, so at
+		// fleet scale an Info line would drown the signal it exists for.
 		if clustersForUcc == nil || clientEndpointResources == nil {
 			logger.Debug("per-client inputs not ready; deferring snapshot", "client", ucc.ResourceName())
 			return nil

@@ -79,10 +79,13 @@ func benchDrainScenario(b *testing.B, v validator.Validator) {
 	finalBackends := krt.NewStaticCollection(nil, backends, krtopts.ToOptions("FinalBackends")...)
 	clusters := NewPerClientEnvoyClusters(ctx, krtopts, benchTranslator(v), finalBackends, uccs)
 
+	// A client is served on its first read regardless; what drains is the row
+	// cache catching up with it, which is the work this benchmark measures.
 	waitDrained := func(ucc ir.UniquelyConnectedClient) {
 		deadline := time.Now().Add(10 * time.Minute)
 		for time.Now().Before(deadline) {
-			if rows, _ := clusters.FetchClustersForClient(krt.TestingDummyContext{}, ucc); len(rows) == benchBackends {
+			if rowsEvaluated(clusters, ucc) &&
+				len(clusters.FetchClustersForClient(krt.TestingDummyContext{}, ucc)) == benchBackends {
 				return
 			}
 			time.Sleep(5 * time.Millisecond)
@@ -100,7 +103,7 @@ func benchDrainScenario(b *testing.B, v validator.Validator) {
 		uccs.DeleteObject(probe.ResourceName())
 		deadline := time.Now().Add(10 * time.Minute)
 		for time.Now().Before(deadline) {
-			if rows, _ := clusters.FetchClustersForClient(krt.TestingDummyContext{}, probe); len(rows) == 0 {
+			if !rowsEvaluated(clusters, probe) {
 				break
 			}
 			time.Sleep(5 * time.Millisecond)

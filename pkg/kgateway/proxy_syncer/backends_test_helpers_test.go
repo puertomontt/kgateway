@@ -1,8 +1,11 @@
 package proxy_syncer
 
 import (
+	"context"
+
 	"istio.io/istio/pkg/kube/krt"
 
+	"github.com/kgateway-dev/kgateway/v2/pkg/kgateway/translator/irtranslator"
 	"github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/ir"
 )
 
@@ -35,10 +38,21 @@ func resolvedBase(cluster uccWithCluster, clients *clientInputSnapshot) backendC
 	}
 }
 
+// testPerClientClusters wraps a static row collection the way the constructor
+// wraps the real one. translator evaluates clients the rows have not; rows built
+// by these helpers carry no Base, so it is only reached by tests that set one.
+func testPerClientClusters(clusters krt.Collection[backendClusters], translator *irtranslator.BackendTranslator) PerClientEnvoyClusters {
+	return PerClientEnvoyClusters{
+		clusters:   clusters,
+		translator: translator,
+		ctx:        context.Background(),
+	}
+}
+
 // newTestPerClientClustersRaw builds a PerClientEnvoyClusters directly from
-// base entries and sparse deltas, every row evaluated against clients. clients
-// must include every UCC that the caller will query; passing them explicitly
-// models the production client-resolution fence.
+// base entries and sparse deltas, every row evaluated against clients. Clients
+// not listed are evaluated by the reader against a translator with no overlays,
+// so they are served the base.
 func newTestPerClientClustersRaw(
 	bases []baseEnvoyCluster,
 	deltas []uccClusterDelta,
@@ -67,9 +81,7 @@ func newTestPerClientClustersRaw(
 		}
 		rows = append(rows, row)
 	}
-	return PerClientEnvoyClusters{
-		clusters: krt.NewStaticCollection[backendClusters](nil, rows),
-	}
+	return testPerClientClusters(krt.NewStaticCollection[backendClusters](nil, rows), clustersTestTranslator())
 }
 
 // newTestPerClientClusters builds a PerClientEnvoyClusters from flat cluster
@@ -96,6 +108,6 @@ func newTestPerClientClusters(initial []uccWithCluster) (PerClientEnvoyClusters,
 	}
 
 	clusterCol := krt.NewStaticCollection[backendClusters](nil, rows)
-	pcc := PerClientEnvoyClusters{clusters: clusterCol}
+	pcc := testPerClientClusters(clusterCol, clustersTestTranslator())
 	return pcc, &testClusterCols{clusters: clusterCol, clients: clientSnapshot}
 }
