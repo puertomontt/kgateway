@@ -185,6 +185,32 @@ func (w Writer[O, S]) decide(res Resource, current O) writeDecision[S] {
 	return writeDecision[S]{status: merged, has: true, write: true}
 }
 
+// StatusPreviewer is implemented by status syncers that can report the status ApplyStatus
+// would publish for a resource without writing it. Writer implements it; the translator
+// golden-test harness uses it to capture statuses from registrations added via
+// WithStatusRegistration.
+type StatusPreviewer interface {
+	PreviewStatus(res Resource) (status any, ok bool)
+}
+
+var _ StatusPreviewer = Writer[*gwv1.Gateway, *gwv1.GatewayStatus]{}
+
+// PreviewStatus returns the merged status ApplyStatus would publish for res, from the same
+// Current/Desired/Merge sequence, without any API call. ok is false when the resource is gone
+// or the writer has no desired status for it. The status is returned whether or not it
+// already matches the live one.
+func (w Writer[O, S]) PreviewStatus(res Resource) (any, bool) {
+	current := w.Current(res)
+	if controllers.IsNil(current) {
+		return nil, false
+	}
+	decision := w.decide(res, current)
+	if !decision.has {
+		return nil, false
+	}
+	return decision.status, true
+}
+
 // attemptOutcome is what the last write attempt saw, carried out of the retry closure for
 // OnSync. Keeping it in one value rather than three loose variables means the reader does not
 // have to work out which attempt last assigned each of them: they are always from the same one.

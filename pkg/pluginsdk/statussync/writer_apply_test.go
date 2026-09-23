@@ -210,3 +210,46 @@ type unloadedClient[T controllers.ComparableObject] struct {
 }
 
 func (unloadedClient[T]) Get(string, string) T { return ptr.Empty[T]() }
+
+// PreviewStatus answers what ApplyStatus would publish from the same build/merge sequence,
+// without touching the API server.
+func TestPreviewStatusReturnsMergedStatusWithoutWriting(t *testing.T) {
+	writer, result, fake := newTestWriter(t, true)
+	writer.Merge = func(_ *gwv1.HTTPRoute, desired gwv1.RouteStatus) gwv1.RouteStatus {
+		desired.Parents = append(desired.Parents, gwv1.RouteParentStatus{
+			ParentRef:      gwv1.ParentReference{Name: "merged"},
+			ControllerName: otherController,
+		})
+		return desired
+	}
+
+	status, ok := writer.PreviewStatus(testRouteResource())
+
+	require.True(t, ok)
+	routeStatus, isRouteStatus := status.(gwv1.RouteStatus)
+	require.True(t, isRouteStatus, "the preview must carry the writer's status type, got %T", status)
+	require.Equal(t, []gwv1.ObjectName{"gw", "merged"},
+		[]gwv1.ObjectName{routeStatus.Parents[0].ParentRef.Name, routeStatus.Parents[1].ParentRef.Name},
+		"the preview must be the merged status, as ApplyStatus would publish it")
+	require.Zero(t, countUpdates(fake), "a preview must not write")
+	require.Zero(t, result.calls.Load(), "a preview is not a sync and must not run OnSync")
+}
+
+func TestPreviewStatusSkipsMissingResource(t *testing.T) {
+	writer, _, _ := newTestWriter(t, false)
+
+	_, ok := writer.PreviewStatus(testRouteResource())
+
+	require.False(t, ok)
+}
+
+func TestPreviewStatusHonorsSuppressedDesired(t *testing.T) {
+	writer, _, _ := newTestWriter(t, true)
+	writer.Desired = func(Resource, *gwv1.HTTPRoute) (gwv1.RouteStatus, bool) {
+		return gwv1.RouteStatus{}, false
+	}
+
+	_, ok := writer.PreviewStatus(testRouteResource())
+
+	require.False(t, ok)
+}

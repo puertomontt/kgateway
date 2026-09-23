@@ -34,6 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gwv1a2 "sigs.k8s.io/gateway-api/apis/v1alpha2"
 
@@ -56,9 +57,11 @@ import (
 	"github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/ir"
 	"github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/krtutil"
 	"github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/reporter"
+	"github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/statussync"
 	"github.com/kgateway-dev/kgateway/v2/pkg/reports"
 	"github.com/kgateway-dev/kgateway/v2/pkg/schemes"
 	"github.com/kgateway-dev/kgateway/v2/pkg/utils/envutils"
+	krtpkg "github.com/kgateway-dev/kgateway/v2/pkg/utils/krtutil"
 	"github.com/kgateway-dev/kgateway/v2/pkg/validator"
 	"github.com/kgateway-dev/kgateway/v2/test/testutils"
 )
@@ -246,9 +249,24 @@ func marshalProtoMessages[T proto.Message](messages []T, m protojson.MarshalOpti
 
 type ExtraPluginsFn func(ctx context.Context, commoncol *collections.CommonCollections, mergeSettingsJSON string) []pluginsdk.Plugin
 
+// ExtraPlugins is what ExtraPluginsWithStatusFn contributes: plugins, plus the resource status
+// registrations built alongside them.
+type ExtraPlugins struct {
+	Plugins []pluginsdk.Plugin
+	// StatusRegistrations are registrations as passed to proxy_syncer.WithStatusRegistration.
+	// The statuses their writers would publish for the input objects are captured under
+	// Statuses.Resources.
+	StatusRegistrations []proxy_syncer.StatusRegistration
+}
+
+type ExtraPluginsWithStatusFn func(ctx context.Context, commoncol *collections.CommonCollections, mergeSettingsJSON string) ExtraPlugins
+
 type ExtraConfig struct {
-	NewClientFn           func(*testing.T, ...client.Object) apiclient.Client
-	PluginsFn             ExtraPluginsFn
+	NewClientFn func(*testing.T, ...client.Object) apiclient.Client
+	PluginsFn   ExtraPluginsFn
+	// PluginsWithStatusFn is an alternative to PluginsFn for plugins that also register
+	// resource status writers. At most one of the two may be set.
+	PluginsWithStatusFn   ExtraPluginsWithStatusFn
 	Schemes               runtime.SchemeBuilder
 	GVKToStructuralSchema map[schema.GroupVersionKind]*apiserverschema.Structural
 }
@@ -310,6 +328,7 @@ func TestTranslationWithExtraPlugins(
 		Secrets:       result.Proxy.Secrets,
 		Statuses:      buildStatusesFromReports(result.ReportsMap, result.Gateways, result.ListenerSets),
 	}
+	output.Statuses.Resources = result.ResourceStatuses
 	outputYaml, err := testutils.MarshalAnyYaml(output)
 	r.NoErrorf(err, "error marshaling output to YAML; actual result: %s", outputYaml)
 
@@ -347,6 +366,9 @@ type ActualTestResult struct {
 	ListenerSets  map[types.NamespacedName]*gwv1.ListenerSet
 	PolicyPlugins map[schema.GroupKind]pluginsdk.PolicyPlugin
 	Clusters      []*envoyclusterv3.Cluster
+	// ResourceStatuses holds the statuses the extra status registrations would publish,
+	// keyed by "<Kind>/<namespace>/<name>". It is shared by every gateway's result.
+	ResourceStatuses map[string]any
 }
 
 func compareProxy(expectedFile string, actualProxy *irtranslator.TranslationResult) (string, error) {
@@ -747,10 +769,18 @@ func (tc TestCase) Run(
 	// TODO: consider moving the common code to a util that both proxy syncer and this test call
 	plugins = append(plugins, krtcollections.NewBuiltinPlugin(ctx))
 
+	r.False(extraConfig.PluginsFn != nil && extraConfig.PluginsWithStatusFn != nil,
+		"at most one of ExtraConfig.PluginsFn and ExtraConfig.PluginsWithStatusFn may be set")
 	var extraPlugs []pluginsdk.Plugin
+	var extraStatusRegistrations []proxy_syncer.StatusRegistration
 	if extraConfig.PluginsFn != nil {
 		extraPlugins := extraConfig.PluginsFn(ctx, commoncol, settings.PolicyMerge)
 		extraPlugs = append(extraPlugs, extraPlugins...)
+	}
+	if extraConfig.PluginsWithStatusFn != nil {
+		extraPlugins := extraConfig.PluginsWithStatusFn(ctx, commoncol, settings.PolicyMerge)
+		extraPlugs = append(extraPlugs, extraPlugins.Plugins...)
+		extraStatusRegistrations = extraPlugins.StatusRegistrations
 	}
 	plugins = append(plugins, extraPlugs...)
 	extensions := registry.MergePlugins(plugins...)
@@ -820,8 +850,22 @@ func (tc TestCase) Run(
 		}
 	}
 
+	// Status facts from every gateway, keyed by ResourceName so the backend contributions
+	// recomputed on each iteration are kept once, for the extra status registrations.
+	statusContributions := map[string]reports.StatusContribution{}
+	addStatusContributions := func(source reports.StatusSource, reportMap reports.ReportMap) {
+		for _, c := range reports.StatusContributionsFromReportMap(source, reportMap) {
+			statusContributions[c.ResourceName()] = c
+		}
+	}
+
 	for _, gw := range commoncol.GatewayIndex.Gateways.List() {
 		xdsSnap, reportsMap := translator.TranslateGateway(krt.TestingDummyContext{}, ctx, gw)
+		// Record the gateway's own facts before the backend reports are merged into reportsMap.
+		addStatusContributions(reports.StatusSource{
+			Kind: reports.GatewayStatusSource,
+			Name: types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}.String(),
+		}, reportsMap)
 
 		// Backend policies (e.g. BackendConfigPolicy) use a different reporting pipeline than gateway policies.
 		// Gateway policies (ListenerPolicy, TrafficPolicy) are reported during gateway translation via the
@@ -833,6 +877,7 @@ func (tc TestCase) Run(
 			backendIRs = append(backendIRs, col.List()...)
 		}
 		backendPolicyReports := proxy_syncer.GenerateBackendPolicyReport(backendIRs)
+		addStatusContributions(reports.StatusSource{Kind: reports.BackendPolicyStatusSource, Name: "backends"}, backendPolicyReports)
 
 		// Merge gateway reports with backend policy reports. A policy can appear in both
 		// (BackendTLSPolicy reports Gateway ancestors from translation and target ancestors
@@ -863,6 +908,7 @@ func (tc TestCase) Run(
 			}
 		}
 		backendStatusReports := proxy_syncer.GenerateBackendStatusReport(kgwBackends, nil, kgwExtraConditions)
+		addStatusContributions(reports.StatusSource{Kind: reports.BackendStatusSource, Name: "backends"}, backendStatusReports)
 		maps.Copy(mergedReports.Backends, backendStatusReports.Backends)
 
 		gwNN := types.NamespacedName{
@@ -920,7 +966,102 @@ func (tc TestCase) Run(
 		results[gwNN] = r
 	}
 
+	resourceStatuses, err := previewStatusRegistrations(
+		ctx,
+		fakeClient,
+		krtOpts,
+		extraStatusRegistrations,
+		slices.Collect(maps.Values(statusContributions)),
+		allObjs,
+		scheme,
+	)
+	if err != nil {
+		return nil, err
+	}
+	for gwNN, result := range results {
+		result.ResourceStatuses = resourceStatuses
+		results[gwNN] = result
+	}
+
 	return results, nil
+}
+
+// previewStatusRegistrations runs the given status registrations the way the status syncer
+// does, then asks each registered writer what status it would publish for every input object
+// of its kind. Nothing is written: the returned statuses come from each writer's
+// Current/Desired/Merge sequence (see statussync.StatusPreviewer), keyed by
+// "<Kind>/<namespace>/<name>" and normalized for golden comparison.
+func previewStatusRegistrations(
+	ctx context.Context,
+	cl apiclient.Client,
+	krtOpts krtutil.KrtOptions,
+	registrations []proxy_syncer.StatusRegistration,
+	contributions []reports.StatusContribution,
+	objs []client.Object,
+	scheme *runtime.Scheme,
+) (map[string]any, error) {
+	if len(registrations) == 0 {
+		return nil, nil
+	}
+
+	statusContributions := krt.NewStaticCollection(nil, contributions, krtOpts.ToOptions("TranslatorTestStatusContributions")...)
+	contributionsByTarget := krtpkg.UnnamedIndex(statusContributions, func(c reports.StatusContribution) []reports.StatusKey {
+		return []reports.StatusKey{c.Target}
+	})
+	statusCollections := statussync.NewStatusCollections()
+	writers := map[schema.GroupVersionKind]statussync.ResourceStatusSyncer{}
+	var registerErr error
+	for _, register := range registrations {
+		register(statussync.RegistrationInputs{
+			Collections:           statusCollections,
+			StatusContributions:   statusContributions,
+			ContributionsByTarget: contributionsByTarget,
+			KrtOpts:               krtOpts,
+			RegisterWriter: func(gvk schema.GroupVersionKind, syncer statussync.ResourceStatusSyncer) {
+				if _, exists := writers[gvk]; exists {
+					registerErr = fmt.Errorf("status writer already registered for %s", gvk)
+					return
+				}
+				writers[gvk] = syncer
+			},
+		})
+	}
+	if registerErr != nil {
+		return nil, registerErr
+	}
+
+	// Start any informers the registrations created, then wait for their report reducers.
+	cl.RunAndWait(ctx.Done())
+	kubeclient.WaitForCacheSync("status registrations", ctx.Done(), statusCollections.HasSynced)
+
+	statuses := map[string]any{}
+	for _, obj := range objs {
+		gvk, err := apiutil.GVKForObject(obj, scheme)
+		if err != nil {
+			return nil, err
+		}
+		writer, ok := writers[gvk]
+		if !ok {
+			continue
+		}
+		previewer, ok := writer.(statussync.StatusPreviewer)
+		if !ok {
+			return nil, fmt.Errorf("status writer for %s does not implement statussync.StatusPreviewer", gvk)
+		}
+		status, ok := previewer.PreviewStatus(statussync.Resource{
+			GroupVersionKind: gvk,
+			NamespacedName:   client.ObjectKeyFromObject(obj),
+		})
+		if !ok {
+			continue
+		}
+		normalized, err := normalizeResourceStatus(status)
+		if err != nil {
+			return nil, fmt.Errorf("normalizing %s status for %s: %w", gvk.Kind, client.ObjectKeyFromObject(obj), err)
+		}
+		statuses[fmt.Sprintf("%s/%s/%s", gvk.Kind, obj.GetNamespace(), obj.GetName())] = normalized
+	}
+	return statuses, nil
 }
 
 // translateBackendForGolden selects the base or per-client cluster using the

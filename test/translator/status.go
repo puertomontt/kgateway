@@ -1,7 +1,9 @@
 package translator
 
 import (
+	"encoding/json"
 	"fmt"
+	"maps"
 	"slices"
 	"time"
 
@@ -28,6 +30,10 @@ type Statuses struct {
 	GRPCRoutes   map[string]*gwv1.RouteStatus       `json:"grpcRoutes,omitempty"`
 	Policies     map[string]*gwv1.PolicyStatus      `json:"policies,omitempty"`
 	Backends     map[string]*kgateway.BackendStatus `json:"backends,omitempty"`
+	// Resources holds the statuses that ExtraConfig status registrations would publish,
+	// keyed by "<Kind>/<namespace>/<name>". Each value is the status in its JSON form, since
+	// the registered kinds' status types are not known to this package.
+	Resources map[string]any `json:"resources,omitempty"`
 }
 
 func buildStatusesFromReports(
@@ -250,6 +256,39 @@ func normalizeBackendStatus(status *kgateway.BackendStatus, time metav1.Time) {
 	}
 }
 
+// normalizeResourceStatus converts a registered writer's status to its JSON form and clears
+// every lastTransitionTime in it, for deterministic testing. It is the untyped counterpart of
+// the normalize functions above.
+func normalizeResourceStatus(status any) (any, error) {
+	b, err := json.Marshal(status)
+	if err != nil {
+		return nil, err
+	}
+	var out any
+	if err := json.Unmarshal(b, &out); err != nil {
+		return nil, err
+	}
+	clearLastTransitionTimes(out)
+	return out, nil
+}
+
+func clearLastTransitionTimes(v any) {
+	switch v := v.(type) {
+	case map[string]any:
+		for k, child := range v {
+			if k == "lastTransitionTime" {
+				v[k] = nil
+				continue
+			}
+			clearLastTransitionTimes(child)
+		}
+	case []any:
+		for _, child := range v {
+			clearLastTransitionTimes(child)
+		}
+	}
+}
+
 func compareStatuses(expectedFile string, actualStatuses *Statuses) (string, error) {
 	expectedOutput := &translationResult{}
 	if err := ReadYamlFile(expectedFile, expectedOutput); err != nil {
@@ -294,6 +333,7 @@ func sortStatuses(statuses *Statuses) *Statuses {
 		GRPCRoutes:   make(map[string]*gwv1.RouteStatus),
 		Policies:     make(map[string]*gwv1.PolicyStatus),
 		Backends:     make(map[string]*kgateway.BackendStatus),
+		Resources:    maps.Clone(statuses.Resources),
 	}
 
 	// Sort gateways
