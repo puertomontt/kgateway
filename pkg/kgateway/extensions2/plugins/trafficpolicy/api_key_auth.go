@@ -13,7 +13,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/kgateway-dev/kgateway/v2/api/v1alpha1/kgateway"
-	"github.com/kgateway-dev/kgateway/v2/pkg/kgateway/wellknown"
 	"github.com/kgateway-dev/kgateway/v2/pkg/krtcollections"
 	"github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/collections"
 	"github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/ir"
@@ -75,6 +74,7 @@ type parsedAPIKey struct {
 func constructAPIKeyAuth(
 	krtctx krt.HandlerContext,
 	policy *kgateway.TrafficPolicy,
+	from krtcollections.From,
 	commoncol *collections.CommonCollections,
 	out *trafficPolicySpecIr,
 ) error {
@@ -96,11 +96,6 @@ func constructAPIKeyAuth(
 	// Resolve secrets using SecretIndex with ReferenceGrant validation
 	var secrets []ir.Secret
 	secretGK := schema.GroupKind{Group: "", Kind: "Secret"}
-	policyGK := wellknown.TrafficPolicyGVK.GroupKind()
-	from := krtcollections.From{
-		GroupKind: policyGK,
-		Namespace: policy.Namespace,
-	}
 
 	if ak.SecretRef != nil {
 		secret, err := commoncol.Secrets.GetSecret(krtctx, from, *ak.SecretRef)
@@ -109,7 +104,7 @@ func constructAPIKeyAuth(
 		}
 		secrets = []ir.Secret{*secret}
 	} else if ak.SecretSelector != nil {
-		// Fetch secrets matching labels and namespace with ReferenceGrant validation
+		// Fetch the secrets matching the labels that ReferenceGrants let the policy reference
 		var err error
 		secrets, err = commoncol.Secrets.GetSecretsBySelector(
 			krtctx,
@@ -119,9 +114,6 @@ func constructAPIKeyAuth(
 		)
 		if err != nil {
 			return fmt.Errorf("failed to get secrets by selector: %w", err)
-		}
-		if len(secrets) == 0 {
-			return fmt.Errorf("no secrets found matching selector %v in namespace %s", ak.SecretSelector.MatchLabels, policy.Namespace)
 		}
 	} else {
 		// We shouldn't get here because the spec validation should catch this
