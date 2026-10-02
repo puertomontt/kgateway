@@ -132,9 +132,12 @@ func snapshotPerClient(
 			recordClusterScopingEmission(ucc.ResourceName(),
 				len(clusterResources.Items),
 				len(clustersForUcc.clusters.Items)-len(clusterResources.Items))
-			recordClusterScopingDisabled(ucc.ResourceName(),
-				!listenerRouteSnapshot.EmittedClusters.Filterable())
-			if !listenerRouteSnapshot.EmittedClusters.Filterable() {
+			disabled := !listenerRouteSnapshot.EmittedClusters.Filterable()
+			recordClusterScopingDisabled(ucc.ResourceName(), disabled)
+			// Logged on the transition, not on every recompute: this transform
+			// re-runs on every endpoint change in the client's scope, and the
+			// disabled_gateways gauge carries the steady state.
+			if clusterScopingDisabledChanged(ucc.ResourceName(), disabled) && disabled {
 				logger.Warn("cluster scoping disabled for this gateway: a route selects its destination at request time",
 					"client", ucc.ResourceName(),
 					"unresolvable", listenerRouteSnapshot.EmittedClusters.Unresolvable)
@@ -180,7 +183,13 @@ func snapshotPerClient(
 		snap.missingReferenced = missingClusters
 		snap.missingEndpointsReferenced = missingEndpointClusters
 		snap.erroredClusters = clustersForUcc.erroredClusters
+		snap.erroredClustersHash = clustersForUcc.erroredClustersHash
 		snap.referencedClusters = listenerRouteSnapshot.ReferencedClusters
+		if scoping.ScopesClusters() {
+			// The emitted set adds the ancillary clusters listeners name to the
+			// route targets; reference-ahead must deliver those first too.
+			snap.referencedClusters = listenerRouteSnapshot.EmittedClusters.Names
+		}
 		snap.proxyKey = ucc.ResourceName()
 		snapshot := &envoycache.Snapshot{}
 		snapshot.Resources[envoycachetypes.Cluster] = clusterResources
@@ -214,6 +223,9 @@ func snapshotPerClient(
 
 		switch o.Event {
 		case controllers.EventDelete:
+			if scoping.ScopesClusters() {
+				clearClusterScoping(o.Latest().ResourceName())
+			}
 			snapshotResources.Set(0, snapshotResourcesMetricLabels{
 				Gateway:   cd.Gateway,
 				Namespace: cd.Namespace,
@@ -527,6 +539,10 @@ func walkProtoValue(v protoreflect.Value, visit func(proto.Message)) {
 			// Typed extensions whose Go types aren't linked into this binary will fail here;
 			// that's expected, but log at debug so genuinely malformed configs are diagnosable.
 			logger.Debug("skipping typed_config during cluster reference scan", "type_url", anyMsg.GetTypeUrl(), "error", err)
+			// Visit the opaque Any itself, so a collector that must not miss a
+			// reference (emission) can treat it as unresolvable; the gating
+			// extractor ignores it.
+			visit(anyMsg)
 			return
 		}
 		walkProto(nestedMsg, visit)

@@ -12,7 +12,10 @@ import (
 
 // newlyEmittedReferences returns the clusters this build both references and
 // emits for the first time: present in the snapshot being published, named by
-// its routes, and absent from what the client has already been sent.
+// its routes or listeners (snapWrap.referencedClusters is the emitted set when
+// CDS is scoped, so an ext_authz or JWKS cluster counts as much as a route
+// target), absent from what the client has already been sent, and not already
+// named by the published configuration.
 //
 // These are the additions that need the route update held back a beat. Putting
 // the new cluster and the route that targets it in one coherent snapshot does
@@ -58,8 +61,50 @@ func newlyEmittedReferences(snapWrap XdsSnapWrapper, published envoycache.Resour
 		}
 		newly = append(newly, name)
 	}
+	if len(newly) > 0 {
+		// A cluster the published configuration already names is new to CDS
+		// only (a first publish at budget expiry, or a cluster that was
+		// errored), not to the routing types: holding would pin unrelated
+		// updates for nothing. The deferred path exempts the same case.
+		live := publishedEmittedClusters(published)
+		newly = slices.DeleteFunc(newly, func(name string) bool {
+			_, named := live[name]
+			return named
+		})
+	}
 	slices.Sort(newly)
 	return newly
+}
+
+// newlyEmittedLocked is newlyEmittedReferences plus the clusters an open
+// reference-ahead hold is still delivering. The held publish puts those in the
+// published CDS, so without this the next build -- any endpoint change -- would
+// see nothing new and release the routes long before the window closed.
+// Callers must hold the gate lock.
+func (g *publishGate) newlyEmittedLocked(snapWrap XdsSnapWrapper, published envoycache.ResourceSnapshot) []string {
+	if !g.holdsReferenceAhead() {
+		return nil
+	}
+	newly := newlyEmittedReferences(snapWrap, published)
+	if pf := g.pendingFlips[snapWrap.proxyKey]; pf != nil && pf.referenceAhead {
+		building := snapWrap.snap.Resources[envoycachetypes.Cluster].Items
+		for _, name := range pf.blocking {
+			if _, emitting := building[name]; emitting && !slices.Contains(newly, name) {
+				newly = append(newly, name)
+			}
+		}
+		slices.Sort(newly)
+	}
+	return newly
+}
+
+// publishedEmittedClusters returns every cluster the published routes and
+// listeners could name: route targets and ancillary references alike. A hold
+// that pins those routing types must keep all of them.
+func publishedEmittedClusters(published envoycache.ResourceSnapshot) map[string]struct{} {
+	routes := envoycache.Resources{Items: published.GetResourcesAndTTL(envoyresourcev3.RouteType)}
+	listeners := envoycache.Resources{Items: published.GetResourcesAndTTL(envoyresourcev3.ListenerType)}
+	return collectReferencedClustersForEmission(routes, listeners).Names
 }
 
 // holdsReferenceAhead reports whether the addition-side hold is configured.

@@ -9,6 +9,7 @@ import (
 	envoycache "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/known/anypb"
 
 	"github.com/kgateway-dev/kgateway/v2/pkg/kgateway/wellknown"
 )
@@ -148,20 +149,34 @@ func addCandidate(candidates map[string]struct{}, s string) {
 //
 // All three oneof arms are named explicitly rather than matched by exclusion,
 // so a new declarative arm does not silently disable filtering, and so the
-// inline arm — the easiest to overlook — cannot be dropped by accident.
+// inline arm — the easiest to overlook — cannot be dropped by accident. Weighted
+// cluster entries and mirror policies carry their own cluster_header and are
+// reported the same way, as is any typed_config the walk could not decode.
 func collectUnresolvableSelectors(msg proto.Message, unresolvable map[string]struct{}) {
-	action, ok := msg.(*envoyroutev3.RouteAction)
-	if !ok {
-		return
-	}
-
-	switch action.GetClusterSpecifier().(type) {
-	case *envoyroutev3.RouteAction_ClusterHeader:
-		unresolvable[fmt.Sprintf("cluster_header %q", action.GetClusterHeader())] = struct{}{}
-	case *envoyroutev3.RouteAction_ClusterSpecifierPlugin:
-		unresolvable[fmt.Sprintf("cluster_specifier_plugin %q", action.GetClusterSpecifierPlugin())] = struct{}{}
-	case *envoyroutev3.RouteAction_InlineClusterSpecifierPlugin:
-		name := action.GetInlineClusterSpecifierPlugin().GetExtension().GetName()
-		unresolvable[fmt.Sprintf("inline_cluster_specifier_plugin %q", name)] = struct{}{}
+	switch typed := msg.(type) {
+	case *envoyroutev3.RouteAction:
+		switch typed.GetClusterSpecifier().(type) {
+		case *envoyroutev3.RouteAction_ClusterHeader:
+			unresolvable[fmt.Sprintf("cluster_header %q", typed.GetClusterHeader())] = struct{}{}
+		case *envoyroutev3.RouteAction_ClusterSpecifierPlugin:
+			unresolvable[fmt.Sprintf("cluster_specifier_plugin %q", typed.GetClusterSpecifierPlugin())] = struct{}{}
+		case *envoyroutev3.RouteAction_InlineClusterSpecifierPlugin:
+			name := typed.GetInlineClusterSpecifierPlugin().GetExtension().GetName()
+			unresolvable[fmt.Sprintf("inline_cluster_specifier_plugin %q", name)] = struct{}{}
+		}
+	case *envoyroutev3.WeightedCluster_ClusterWeight:
+		// A weighted entry may name its cluster by request header, too.
+		if header := typed.GetClusterHeader(); header != "" {
+			unresolvable[fmt.Sprintf("weighted_cluster_header %q", header)] = struct{}{}
+		}
+	case *envoyroutev3.RouteAction_RequestMirrorPolicy:
+		// So may a mirror policy.
+		if header := typed.GetClusterHeader(); header != "" {
+			unresolvable[fmt.Sprintf("request_mirror_cluster_header %q", header)] = struct{}{}
+		}
+	case *anypb.Any:
+		// The walk only visits an Any it could not decode: whatever it names is
+		// invisible here, so pruning around it is not safe.
+		unresolvable[fmt.Sprintf("undecodable typed_config %q", typed.GetTypeUrl())] = struct{}{}
 	}
 }

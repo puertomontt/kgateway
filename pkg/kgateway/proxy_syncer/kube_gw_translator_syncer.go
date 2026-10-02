@@ -72,15 +72,16 @@ func (s *ProxyTranslator) syncXds(
 	// and the per-cluster resolution only carries cluster/CLA pairs — so we do
 	// not rely on a post-hoc MakeConsistent() pass, which would also have
 	// mutated the snapshot shared with the krt cache. Publication goes
-	// through the publish gate so it cancels any pending bounded publish or
-	// flip release and cannot race an expiring budget timer.
+	// through the publish gate so it cannot race an expiring budget timer; a
+	// publish that holds nothing cancels any pending bounded publish or flip
+	// release.
 	// Both emitted-set transitions produce coherent builds -- a cluster losing
 	// its last reference, and a route gaining a destination never sent to this
 	// client -- so neither can ride the deferred path above. When either window
 	// is configured, a coherent snapshot publishes through the path that makes
-	// them safe.
+	// them safe, which may itself hold the routing types (reference-ahead).
 	if s.gate.appliesTransitionGraces() {
-		if err := s.gate.publishWithTransitionGraces(ctx, s.xdsCache, snapWrap); err != nil {
+		if err := s.gate.publishWithTransitionGraces(ctx, s.xdsCache, snapWrap, s.hasPriorXDSVersion); err != nil {
 			logger.Error("failed to set xds snapshot", "proxy_key", proxyKey, "error", err)
 		}
 		return
@@ -127,7 +128,12 @@ func publishedReferencedClusters(published envoycache.ResourceSnapshot) map[stri
 // new routes publish as-is even with never-ready gaps — used by the gate's
 // flip-release bound so a steady-state-unready reference cannot pin the
 // client's route/listener/secret updates forever (#14352).
-func resolveDeferredPerCluster(snapWrap XdsSnapWrapper, published envoycache.ResourceSnapshot, holdFlips bool, graced map[string]struct{}) (*envoycache.Snapshot, []string) {
+//
+// retained are clusters to carry even though nothing in this build requires
+// them -- an open de-reference window, or the destinations of routing types a
+// reference-ahead hold pins. They are carried like any other reference, but
+// are not counted as carried for being missing from the build.
+func resolveDeferredPerCluster(snapWrap XdsSnapWrapper, published envoycache.ResourceSnapshot, holdFlips bool, retained map[string]struct{}) (*envoycache.Snapshot, []string) {
 	publishedRefs := publishedReferencedClusters(published)
 	oldClusters := published.GetResourcesAndTTL(envoyresourcev3.ClusterType)
 
@@ -178,7 +184,11 @@ func resolveDeferredPerCluster(snapWrap XdsSnapWrapper, published envoycache.Res
 			"flip_blocking", flipBlocking,
 		)
 		recordFlipHeld(snapWrap.proxyKey)
-		for name := range publishedRefs {
+		// The held routes and listeners stay live, so everything they name
+		// stays with them: route targets, and the ancillary clusters (ext_authz,
+		// JWKS, ...) that scoped CDS no longer emits once the build stops
+		// naming them.
+		for name := range publishedEmittedClusters(published) {
 			carryRefs[name] = struct{}{}
 		}
 		heldBlocking = flipBlocking
@@ -188,11 +198,11 @@ func resolveDeferredPerCluster(snapWrap XdsSnapWrapper, published envoycache.Res
 		}
 	}
 
-	// Clusters within their de-reference grace are carried the same way: they
-	// are absent from this build because nothing references them any more, and
-	// they stay published until the window closes so the route update that
-	// stopped naming them reaches Envoy first.
-	for name := range graced {
+	// Retained clusters are carried the same way: they are absent from this
+	// build because nothing in it references them any more, and they stay
+	// published until their window closes so the route update that stopped
+	// naming them reaches Envoy first.
+	for name := range retained {
 		carryRefs[name] = struct{}{}
 	}
 
@@ -262,11 +272,20 @@ func resolveDeferredPerCluster(snapWrap XdsSnapWrapper, published envoycache.Res
 		composed.Resources[envoycachetypes.Endpoint] = versionEndpointResources(
 			composed.Resources[envoycachetypes.Endpoint], nil,
 			endpointClusterDigests(composed.Resources[envoycachetypes.Cluster], nil))
-		logger.Info("carried forward previously-published clusters",
-			"proxy_key", snapWrap.proxyKey,
-			"carried", carried,
-		)
-		recordCarriedClusters(snapWrap.proxyKey, len(carried))
+		// Only clusters carried because the build is missing them are the
+		// readiness signal carried_clusters_total documents; window-retained
+		// ones are routine under scoped CDS.
+		missing := slices.DeleteFunc(slices.Clone(carried), func(name string) bool {
+			_, isRetained := retained[name]
+			return isRetained
+		})
+		if len(missing) > 0 {
+			logger.Info("carried forward previously-published clusters",
+				"proxy_key", snapWrap.proxyKey,
+				"carried", missing,
+			)
+			recordCarriedClusters(snapWrap.proxyKey, len(missing))
+		}
 	}
 
 	return composed, heldBlocking

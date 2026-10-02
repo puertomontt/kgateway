@@ -58,7 +58,11 @@ versions the client already has while the new cluster goes out, then releases.
 cluster in the same snapshot as the route that stopped naming it sends the
 removal first. `KGW_CLUSTER_DEREFERENCE_GRACE` keeps the cluster published for a
 bounded period after its last reference goes away, so the route update always
-lands first. Set this above worst-case RDS propagation for your fleet.
+lands first. Set this above worst-case RDS propagation for your fleet. Connections
+on a removed or changed listener keep using it for Envoy's listener drain time
+(600s by default), so a window shorter than the drain time can remove a cluster
+those draining connections still route to; size it to cover the drain time if
+that matters for your traffic.
 
 Ordered ADS does not substitute for either window: it fixes CDS before RDS,
 which is the wrong order for removals, and it does not close the ACK-skew

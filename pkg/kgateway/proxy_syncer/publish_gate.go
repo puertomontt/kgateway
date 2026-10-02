@@ -2,6 +2,7 @@ package proxy_syncer
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"time"
 
@@ -108,6 +109,10 @@ type publishGate struct {
 	pending      map[string]*pendingFirstPublish
 	pendingFlips map[string]*pendingFlipRelease
 	dereferenced map[string]*dereferenceState
+	// departed marks clients whose wrapper row was deleted while a transition
+	// window applies. Their cached snapshot outlives them (#14307), so a cold
+	// reconnect under the same key must not be held or carried against it.
+	departed map[string]struct{}
 }
 
 type pendingFirstPublish struct {
@@ -128,6 +133,11 @@ type pendingFlipRelease struct {
 	// blocking are the latest flip-blocking cluster names, for the expiry log.
 	blocking []string
 	timer    *time.Timer
+	// referenceAhead marks a hold that only delivers newly-emitted, already-built
+	// clusters ahead of their routes, released on the reference-ahead window. It
+	// is not an unready-cluster hold, so its release is neither a budget expiry
+	// nor a readiness signal.
+	referenceAhead bool
 }
 
 func newPublishGate(budget time.Duration, checkConsistency bool, scoping clusterScoping) *publishGate {
@@ -139,6 +149,7 @@ func newPublishGate(budget time.Duration, checkConsistency bool, scoping cluster
 		pending:          make(map[string]*pendingFirstPublish),
 		pendingFlips:     make(map[string]*pendingFlipRelease),
 		dereferenced:     make(map[string]*dereferenceState),
+		departed:         make(map[string]struct{}),
 	}
 }
 
@@ -157,6 +168,7 @@ func (g *publishGate) setSnapshot(ctx context.Context, cache envoycache.Snapshot
 			recordInconsistentSnapshot(proxyKey)
 		}
 	}
+	delete(g.departed, proxyKey)
 	return cache.SetSnapshot(ctx, proxyKey, snap)
 }
 
@@ -222,20 +234,70 @@ func (g *publishGate) resolveDeferred(
 	// that de-referenced them reaches Envoy before they disappear.
 	graced, soonestExpiry := g.graceDereferencedClustersLocked(
 		snapWrap.proxyKey, published, snapWrap.snap.Resources[envoycachetypes.Cluster], time.Now())
-	resolved, heldBlocking := resolveDeferredPerCluster(snapWrap, published, true, graced)
-	var publishErr error
-	if len(heldBlocking) > 0 {
-		// The held snapshot still publishes (CDS/EDS keep flowing); the
-		// gate additionally arms the flip-release bound for the episode.
-		publishErr = g.publishHeldLocked(ctx, cache, snapWrap, resolved, heldBlocking, false)
-	} else {
-		publishErr = g.publishLocked(ctx, cache, snapWrap.proxyKey, resolved)
-	}
+	publishErr := g.publishResolvedLocked(ctx, cache, snapWrap, published, graced, true)
 	// Armed after publishing: a carried-forward graced cluster is only removed
 	// by this timer, and arming before the publish would let publishLocked's
 	// cleanup cancel the very timer that prunes what it just carried.
 	g.armDereferenceTimerLocked(ctx, cache, snapWrap.proxyKey, snapWrap, soonestExpiry)
 	return publishErr
+}
+
+// publishResolvedLocked publishes wrap against published, applying the hold the
+// build needs: a flip onto an unready cluster is held under the publish budget
+// (only when holdFlips), a destination new to the client under the
+// reference-ahead window. Otherwise the build publishes as resolved, which ends
+// any open hold episode. retained are clusters to carry forward even though
+// the build no longer emits them (an open de-reference window). Callers must
+// hold g.mu.
+func (g *publishGate) publishResolvedLocked(
+	ctx context.Context,
+	cache envoycache.SnapshotCache,
+	wrap XdsSnapWrapper,
+	published envoycache.ResourceSnapshot,
+	retained map[string]struct{},
+	holdFlips bool,
+) error {
+	return g.publishResolvedWithLocked(ctx, cache, wrap, published, retained, holdFlips, g.newlyEmittedLocked(wrap, published))
+}
+
+func (g *publishGate) publishResolvedWithLocked(
+	ctx context.Context,
+	cache envoycache.SnapshotCache,
+	wrap XdsSnapWrapper,
+	published envoycache.ResourceSnapshot,
+	retained map[string]struct{},
+	holdFlips bool,
+	newlyEmitted []string,
+) error {
+	if len(newlyEmitted) > 0 {
+		// The routing types are about to be pinned at their published versions,
+		// so everything they name must stay published with them, whether or
+		// not a de-reference window happens to cover it.
+		carry := publishedEmittedClusters(published)
+		for name := range retained {
+			carry[name] = struct{}{}
+		}
+		retained = carry
+	}
+	resolved, heldBlocking := resolveDeferredPerCluster(wrap, published, holdFlips, retained)
+	if len(heldBlocking) > 0 {
+		// The held snapshot still publishes (CDS/EDS keep flowing); the
+		// gate additionally arms the flip-release bound for the episode.
+		return g.publishHeldLocked(ctx, cache, wrap, resolved, heldBlocking, false)
+	}
+	if len(newlyEmitted) > 0 {
+		fresh := len(newlyEmitted)
+		if pf := g.pendingFlips[wrap.proxyKey]; pf != nil && pf.referenceAhead {
+			for _, name := range newlyEmitted {
+				if slices.Contains(pf.blocking, name) {
+					fresh-- // still being delivered by the open hold; counted when it opened
+				}
+			}
+		}
+		recordClusterScopingTransition(wrap.proxyKey, transitionReferenceAheadHeld, fresh)
+		return g.publishHeldLocked(ctx, cache, wrap, holdRoutingTypes(resolved, published), newlyEmitted, true)
+	}
+	return g.publishLocked(ctx, cache, wrap.proxyKey, resolved)
 }
 
 // offerColdLocked records the latest deferred snapshot for a never-published
@@ -365,11 +427,22 @@ func (g *publishGate) publishHeldLocked(
 		release = g.referenceAhead
 	}
 	if release <= 0 {
-		return nil // bound disabled: hold until the flip resolves
+		// Bound disabled: hold until the flip resolves. A bound armed by an
+		// earlier reference-ahead hold would otherwise release this flip, with
+		// a stale wrapper, on the reference-ahead window.
+		g.cancelFlipReleaseLocked(proxyKey)
+		return nil
 	}
 	pf := g.pendingFlips[proxyKey]
+	if pf != nil && pf.referenceAhead != referenceAheadOnly {
+		// A hold of the other kind joined the episode, and its own bound
+		// applies: an unready flip must not inherit the short reference-ahead
+		// window, nor a reference-ahead hold wait out the budget.
+		g.cancelFlipReleaseLocked(proxyKey)
+		pf = nil
+	}
 	if pf == nil {
-		pf = &pendingFlipRelease{}
+		pf = &pendingFlipRelease{referenceAhead: referenceAheadOnly}
 		g.pendingFlips[proxyKey] = pf
 		pf.timer = time.AfterFunc(release, func() {
 			g.fireFlipRelease(ctx, cache, proxyKey)
@@ -401,16 +474,26 @@ func (g *publishGate) fireFlipRelease(ctx context.Context, cache envoycache.Snap
 	if err != nil {
 		return // nothing published to resolve against; nothing was held
 	}
-	graced, _ := g.graceDereferencedClustersLocked(
+	graced, soonest := g.graceDereferencedClustersLocked(
 		proxyKey, published, pf.wrap.snap.Resources[envoycachetypes.Cluster], time.Now())
 	released, _ := resolveDeferredPerCluster(pf.wrap, published, false, graced)
-	logger.Warn("flip-hold budget expired; publishing held route flip, routes to still-unready clusters will fail until they become ready",
-		"proxy_key", proxyKey, "flip_blocking", pf.blocking)
-	if err := g.setSnapshot(ctx, cache, proxyKey, released); err != nil {
+	if pf.referenceAhead {
+		logger.Debug("reference-ahead window elapsed; publishing held route update",
+			"proxy_key", proxyKey, "newly_emitted", pf.blocking)
+	} else {
+		logger.Warn("flip-hold budget expired; publishing held route flip, routes to still-unready clusters will fail until they become ready",
+			"proxy_key", proxyKey, "flip_blocking", pf.blocking)
+	}
+	err = g.setSnapshot(ctx, cache, proxyKey, released)
+	// A window this release opened (or kept open) needs the timer that closes it.
+	g.armDereferenceTimerLocked(ctx, cache, proxyKey, pf.wrap, soonest)
+	if err != nil {
 		logger.Error("failed to set xds snapshot", "proxy_key", proxyKey, "error", err)
 		return
 	}
-	recordBoundedPublish(proxyKey, boundedPublishFlipRelease)
+	if !pf.referenceAhead {
+		recordBoundedPublish(proxyKey, boundedPublishFlipRelease)
+	}
 }
 
 func (g *publishGate) cancelFlipReleaseLocked(proxyKey string) {
@@ -437,6 +520,9 @@ func (g *publishGate) clientDeparted(proxyKey string) {
 	}
 	g.cancelFlipReleaseLocked(proxyKey)
 	g.cancelDereferenceTimerLocked(proxyKey)
+	if g.appliesTransitionGraces() {
+		g.departed[proxyKey] = struct{}{}
+	}
 }
 
 // snapshotConsistencyError checks the dynamic graph together with the gateway's

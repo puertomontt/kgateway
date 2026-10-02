@@ -462,9 +462,13 @@ type Settings struct {
 	// update always lands first.
 	//
 	// The window must exceed worst-case RDS propagation for the fleet, which is
-	// why it is tunable rather than fixed. 0 removes clusters immediately,
-	// which is only safe if the deployment accepts that race. Ignored in ALL
-	// mode, where nothing is ever de-referenced.
+	// why it is tunable rather than fixed. When a listener is removed or its
+	// filter chain changes, connections on the old chain keep routing through
+	// it for Envoy's drain time (600s unless --drain-time-s says otherwise), so
+	// a window shorter than that can remove a cluster those connections still
+	// use. 0 removes clusters immediately, which is only safe if the deployment
+	// accepts that race. Ignored in ALL mode, where nothing is ever
+	// de-referenced.
 	ClusterDereferenceGrace time.Duration `split_words:"true" default:"5s"`
 
 	// ClusterReferenceAhead is how long a route update that retargets onto a

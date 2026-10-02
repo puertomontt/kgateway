@@ -1,6 +1,8 @@
 package proxy_syncer
 
 import (
+	"sync"
+
 	"github.com/kgateway-dev/kgateway/v2/pkg/metrics"
 )
 
@@ -119,11 +121,38 @@ func recordClusterScopingTransition(clientKey, transition string, count int) {
 		return
 	}
 	cd := getDetailsFromXDSClientResourceName(clientKey)
-	for range count {
-		clusterScopingTransitionsTotal.Inc(
-			metrics.Label{Name: gatewayLabel, Value: cd.Gateway},
-			metrics.Label{Name: namespaceLabel, Value: cd.Namespace},
-			metrics.Label{Name: transitionLabel, Value: transition},
-		)
+	clusterScopingTransitionsTotal.Add(float64(count),
+		metrics.Label{Name: gatewayLabel, Value: cd.Gateway},
+		metrics.Label{Name: namespaceLabel, Value: cd.Namespace},
+		metrics.Label{Name: transitionLabel, Value: transition},
+	)
+}
+
+// clusterScopingDisabledByClient is each client's last-recorded disabled state,
+// so the warning fires when it changes rather than on every recompute.
+var clusterScopingDisabledByClient sync.Map
+
+// clusterScopingDisabledChanged records clientKey's disabled state and reports
+// whether it differs from the previous recompute's.
+func clusterScopingDisabledChanged(clientKey string, disabled bool) bool {
+	previous, seen := clusterScopingDisabledByClient.Swap(clientKey, disabled)
+	return !seen || previous.(bool) != disabled
+}
+
+// clearClusterScoping zeroes a departed client's scoping series, the way
+// snapshot_resources is zeroed: without it a deleted gateway keeps reporting
+// its last value, and an alert on disabled_gateways never resolves.
+func clearClusterScoping(clientKey string) {
+	clusterScopingDisabledByClient.Delete(clientKey)
+	if !metrics.Active() {
+		return
 	}
+	cd := getDetailsFromXDSClientResourceName(clientKey)
+	labels := []metrics.Label{
+		{Name: gatewayLabel, Value: cd.Gateway},
+		{Name: namespaceLabel, Value: cd.Namespace},
+	}
+	clusterScopingEmittedClusters.Set(0, labels...)
+	clusterScopingDroppedClusters.Set(0, labels...)
+	clusterScopingDisabledGateways.Set(0, labels...)
 }

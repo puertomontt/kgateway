@@ -28,8 +28,13 @@ type XdsSnapWrapper struct {
 	// publish-time per-cluster resolution treats them fail-closed: they are
 	// never resurrected from the previously-published snapshot (see
 	// resolveDeferredPerCluster).
-	// +noKrtEquals
+	// +noKrtEquals (erroredClustersHash, compared, covers its membership; order and error text are not compared)
 	erroredClusters []string
+	// erroredClustersHash is the order-independent digest of erroredClusters.
+	// It is compared because a membership change does not always move a
+	// version: with scoped CDS a cluster the build no longer emits can turn
+	// errored while the gate still carries it for a hold or a window.
+	erroredClustersHash uint64
 	// +noKrtEquals
 	proxyKey string
 	// deferred marks a snapshot built while some referenced cluster was not
@@ -51,13 +56,14 @@ type XdsSnapWrapper struct {
 	// EDS cluster without an endpoints row; kube Services always derive a
 	// row, even sliceless ones like ExternalName). A derived-but-empty CLA
 	// is the backend's known truth and is NOT listed (#14352). Sorted.
-	// referencedClusters is the dataplane-referenced cluster set of THIS
-	// build, carried so publication can tell a cluster this build newly names
-	// from one the published config was already using. Computed once per
-	// gateway rather than re-walked per publish.
-	// +noKrtEquals (a change reaches Equals through the route/listener versions it was derived from)
-	referencedClusters         map[string]struct{}
 	missingEndpointsReferenced []string
+	// referencedClusters is the cluster set THIS build's routes and listeners
+	// name -- the emitted set when CDS is scoped, so ancillary clusters count --
+	// carried so publication can tell a cluster this build newly names from one
+	// the published config was already using. Computed once per gateway rather
+	// than re-walked per publish.
+	// +noKrtEquals (a change reaches Equals through the route/listener versions it was derived from)
+	referencedClusters map[string]struct{}
 }
 
 func (p XdsSnapWrapper) WithSnapshot(snap *envoycache.Snapshot) XdsSnapWrapper {
@@ -83,11 +89,13 @@ func (p XdsSnapWrapper) Equals(in XdsSnapWrapper) bool {
 	// has already derived its (empty) truth — unbounded when the publish
 	// budget is disabled. The same applies to a referenced cluster arriving
 	// errored-from-birth (missingReferenced shrinks, no version changes).
-	// erroredClusters needs no comparison: membership changes always change
-	// the CDS version (an errored cluster leaves/enters the cluster items and
-	// hash), and error-text-only changes are deliberately suppressed.
+	// The errored set is compared by its name digest: with scoped CDS a
+	// cluster outside the emitted set can turn errored without moving any
+	// version, yet the gate may still be carrying it, and the fail-closed rule
+	// needs the change. Error-text-only changes stay suppressed.
 	return slices.Equal(p.missingReferenced, in.missingReferenced) &&
-		slices.Equal(p.missingEndpointsReferenced, in.missingEndpointsReferenced)
+		slices.Equal(p.missingEndpointsReferenced, in.missingEndpointsReferenced) &&
+		p.erroredClustersHash == in.erroredClustersHash
 }
 
 func (p XdsSnapWrapper) ResourceName() string {

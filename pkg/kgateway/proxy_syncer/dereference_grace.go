@@ -21,6 +21,10 @@ type dereferenceState struct {
 	// closes; nothing else recomputes it merely because time passed.
 	wrap  XdsSnapWrapper
 	timer *time.Timer
+	// gen identifies the armed timer. A callback that fired but lost the lock
+	// race to a re-arm (or to the state being replaced) sees a different gen
+	// and does nothing, since Stop cannot recall it.
+	gen uint64
 }
 
 // graceDereferencedClusters decides which of the currently-published clusters a
@@ -56,6 +60,7 @@ func (g *publishGate) graceDereferencedClustersLocked(
 	var graced map[string]struct{}
 	var soonest time.Duration
 	var opened, pruned int
+	var publishedNames map[string]struct{}
 	for name := range publishedClusters {
 		if _, stillEmitted := building.Items[name]; stillEmitted {
 			// Re-referenced (or never de-referenced): drop any record, so the
@@ -72,7 +77,19 @@ func (g *publishGate) graceDereferencedClustersLocked(
 			g.dereferenced[proxyKey] = state
 		}
 		left, recorded := state.since[name]
-		if !recorded {
+		if recorded {
+			// The window runs from when the published routing types stop
+			// naming the cluster, not from when a build first omits it: while
+			// a held flip keeps the old routes live, the clock must not run
+			// down, or the cluster goes in the same snapshot as the release.
+			if publishedNames == nil {
+				publishedNames = publishedEmittedClusters(published)
+			}
+			if _, stillNamed := publishedNames[name]; stillNamed {
+				left = now
+				state.since[name] = left
+			}
+		} else {
 			left = now
 			state.since[name] = left
 		}
@@ -100,8 +117,19 @@ func (g *publishGate) graceDereferencedClustersLocked(
 		}
 	}
 
-	if state != nil && len(state.since) == 0 {
-		g.cancelDereferenceTimerLocked(proxyKey)
+	if state != nil {
+		// A recorded cluster that is no longer published was not carried: it
+		// errored (carrying is fail-closed) or another path removed it. Its
+		// window protects nothing, and keeping the record would keep the state,
+		// and a timer holding an older wrapper, alive past every later publish.
+		for name := range state.since {
+			if _, stillPublished := publishedClusters[name]; !stillPublished {
+				delete(state.since, name)
+			}
+		}
+		if len(state.since) == 0 {
+			g.cancelDereferenceTimerLocked(proxyKey)
+		}
 	}
 	recordClusterScopingTransition(proxyKey, transitionDereferenceGraced, opened)
 	recordClusterScopingTransition(proxyKey, transitionDereferencePruned, pruned)
@@ -131,8 +159,10 @@ func (g *publishGate) armDereferenceTimerLocked(
 	if state.timer != nil {
 		state.timer.Stop()
 	}
+	state.gen++
+	gen := state.gen
 	state.timer = time.AfterFunc(in, func() {
-		g.fireDereferencePrune(ctx, cache, proxyKey)
+		g.fireDereferencePrune(ctx, cache, proxyKey, state, gen)
 	})
 }
 
@@ -148,12 +178,21 @@ func (g *publishGate) cancelDereferenceTimerLocked(proxyKey string) {
 // fireDereferencePrune re-publishes the client's latest snapshot now that a
 // grace window has closed, under the same lock as every other publication, so
 // pruning cannot race a coherent publish.
-func (g *publishGate) fireDereferencePrune(ctx context.Context, cache envoycache.SnapshotCache, proxyKey string) {
+//
+// It re-applies whatever hold is open rather than publishing the unheld build:
+// closing a de-reference window must not also release a route flip held for an
+// unready cluster, or a reference-ahead hold, before that hold's own bound.
+func (g *publishGate) fireDereferencePrune(
+	ctx context.Context,
+	cache envoycache.SnapshotCache,
+	proxyKey string,
+	armed *dereferenceState,
+	gen uint64,
+) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	state := g.dereferenced[proxyKey]
-	if state == nil {
-		return // every graced cluster was re-referenced while the timer was in flight
+	if state := g.dereferenced[proxyKey]; state != armed || state.gen != gen {
+		return // the window closed, or the timer was re-armed, while this callback waited
 	}
 	published, err := cache.GetSnapshot(proxyKey)
 	if err != nil {
@@ -161,15 +200,16 @@ func (g *publishGate) fireDereferencePrune(ctx context.Context, cache envoycache
 		return
 	}
 
-	wrap := state.wrap
+	wrap := armed.wrap
 	graced, soonest := g.graceDereferencedClustersLocked(
 		proxyKey, published, wrap.snap.Resources[envoycachetypes.Cluster], time.Now())
-	resolved, _ := resolveDeferredPerCluster(wrap, published, false, graced)
 	logger.Debug("de-reference grace elapsed; re-publishing without the expired clusters",
 		"proxy_key", proxyKey, "still_graced", len(graced))
-	if err := g.setSnapshot(ctx, cache, proxyKey, resolved); err != nil {
+	// holdFlips follows the wrapper, as in resolveDeferred: a flip already
+	// released is published and no longer flip-blocking, so this re-holds only
+	// a flip still waiting on its cluster (budget or not).
+	if err := g.publishResolvedLocked(ctx, cache, wrap, published, graced, wrap.deferred); err != nil {
 		logger.Error("failed to set xds snapshot", "proxy_key", proxyKey, "error", err)
-		return
 	}
 	g.armDereferenceTimerLocked(ctx, cache, proxyKey, wrap, soonest)
 }
@@ -191,14 +231,19 @@ func (g *publishGate) publishWithTransitionGraces(
 	ctx context.Context,
 	cache envoycache.SnapshotCache,
 	snapWrap XdsSnapWrapper,
+	hasPriorXDSVersion func(string) bool,
 ) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
 	published, err := cache.GetSnapshot(snapWrap.proxyKey)
-	if err != nil {
-		// Never published: there is nothing to carry forward, and nothing can
-		// have been de-referenced yet.
+	_, departed := g.departed[snapWrap.proxyKey]
+	coldReconnect := departed && (hasPriorXDSVersion == nil || !hasPriorXDSVersion(snapWrap.proxyKey))
+	if err != nil || coldReconnect {
+		// Never published, or the cached snapshot belongs to a client that has
+		// since departed and reconnected cold (the cache entry outlives it,
+		// #14307): either way it is not what this client holds, so there is
+		// nothing to carry forward or hold against.
 		return g.publishLocked(ctx, cache, snapWrap.proxyKey, snapWrap.snap)
 	}
 
@@ -210,29 +255,12 @@ func (g *publishGate) publishWithTransitionGraces(
 	// Holding routes, listeners and secrets at their published versions
 	// publishes the new cluster's CDS by itself, and the existing flip-release
 	// timer sends the route once the window closes.
-	var newlyEmitted []string
-	if g.holdsReferenceAhead() {
-		newlyEmitted = newlyEmittedReferences(snapWrap, published)
-	}
-
+	newlyEmitted := g.newlyEmittedLocked(snapWrap, published)
 	if len(graced) == 0 && len(newlyEmitted) == 0 {
 		return g.publishLocked(ctx, cache, snapWrap.proxyKey, snapWrap.snap)
 	}
 
-	resolved, _ := resolveDeferredPerCluster(snapWrap, published, false, graced)
-	var publishErr error
-	if len(newlyEmitted) > 0 {
-		held := holdRoutingTypes(resolved, published)
-		recordFlipHeld(snapWrap.proxyKey)
-		recordClusterScopingTransition(snapWrap.proxyKey, transitionReferenceAheadHeld, len(newlyEmitted))
-		recordClusterScopingTransition(snapWrap.proxyKey, transitionReferenceAheadHeld, len(newlyEmitted))
-		publishErr = g.publishHeldLocked(ctx, cache, snapWrap, held, newlyEmitted, true)
-	} else {
-		publishErr = g.setSnapshot(ctx, cache, snapWrap.proxyKey, resolved)
-	}
-	if publishErr != nil {
-		return publishErr
-	}
+	publishErr := g.publishResolvedWithLocked(ctx, cache, snapWrap, published, graced, false, newlyEmitted)
 	g.armDereferenceTimerLocked(ctx, cache, snapWrap.proxyKey, snapWrap, soonest)
-	return nil
+	return publishErr
 }
