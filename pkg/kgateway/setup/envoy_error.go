@@ -37,6 +37,13 @@ var (
 		}, []string{gwNamespaceLabel, gwNameLabel, typeURLLabel})
 )
 
+func init() {
+	// xdsRejectsCurrent is not scoped: its series are deleted when the last stream
+	// rejecting a resource recovers or closes.
+	metrics.RegisterGatewayScoped(xdsRejectsTotal, gwNamespaceLabel, gwNameLabel)
+	metrics.RegisterNamespaceScoped(xdsRejectsTotal, gwNamespaceLabel)
+}
+
 type resourceKey struct {
 	Namespace       string
 	Name            string
@@ -56,6 +63,9 @@ func newResourceState() resourceState {
 type logNackCallback struct {
 	xdsserver.CallbackFuncs
 	streamState map[int64]resourceState
+	// activeRejects counts, per resource, the streams currently rejecting it. It
+	// mirrors xdsRejectsCurrent so the series can be deleted when it reaches zero.
+	activeRejects map[resourceKey]int
 
 	lock sync.Mutex
 }
@@ -64,7 +74,8 @@ var _ xdsserver.Callbacks = (*logNackCallback)(nil)
 
 func newLogNackCallback() *logNackCallback {
 	return &logNackCallback{
-		streamState: make(map[int64]resourceState),
+		streamState:   make(map[int64]resourceState),
+		activeRejects: make(map[resourceKey]int),
 	}
 }
 
@@ -121,12 +132,27 @@ func (l *logNackCallback) OnStreamRequest(streamID int64, req *discoveryv3.Disco
 func (l *logNackCallback) onNewError(key resourceKey, err *status.Status) {
 	labels := toLabels(key)
 	xdsRejectsTotal.Inc(labels...)
-	xdsRejectsCurrent.Add(1, labels...)
+
+	l.lock.Lock()
+	l.activeRejects[key]++
+	xdsRejectsCurrent.Set(float64(l.activeRejects[key]), labels...)
+	l.lock.Unlock()
+
 	envoyLogger.Warn("xds error", "gateway_name", key.Name, "gateway_ns", key.Namespace, "resource", key.ResourceTypeUrl, "error", err.Message)
 }
 
 func (l *logNackCallback) onErrorGone(key resourceKey) {
-	xdsRejectsCurrent.Add(-1, toLabels(key)...)
+	l.lock.Lock()
+	defer l.lock.Unlock()
+
+	n := l.activeRejects[key] - 1
+	if n > 0 {
+		l.activeRejects[key] = n
+		xdsRejectsCurrent.Set(float64(n), toLabels(key)...)
+		return
+	}
+	delete(l.activeRejects, key)
+	xdsRejectsCurrent.DeletePartialMatch(toLabels(key)...)
 }
 
 func (l *logNackCallback) handleNoError(streamID int64, key resourceKey) bool {

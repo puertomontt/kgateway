@@ -9,11 +9,9 @@ import (
 	envoyendpointv3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	envoycachetypes "github.com/envoyproxy/go-control-plane/pkg/cache/types"
 	envoycache "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
-	"istio.io/istio/pkg/kube/controllers"
 	"istio.io/istio/pkg/kube/krt"
 
 	"github.com/kgateway-dev/kgateway/v2/pkg/kgateway/utils"
-	"github.com/kgateway-dev/kgateway/v2/pkg/metrics"
 	"github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/ir"
 	krtutil "github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/krtutil"
 )
@@ -159,81 +157,8 @@ func snapshotPerClient(
 		return &snap
 	}, krtopts.ToOptions("PerClientXdsSnapshots")...)
 
-	metrics.RegisterEvents(xdsSnapshotsForUcc, func(o krt.Event[XdsSnapWrapper]) {
-		cd := getDetailsFromXDSClientResourceName(o.Latest().ResourceName())
-
-		switch o.Event {
-		case controllers.EventDelete:
-			snapshotResources.Set(0, snapshotResourcesMetricLabels{
-				Gateway:   cd.Gateway,
-				Namespace: cd.Namespace,
-				Resource:  "Cluster",
-			}.toMetricsLabels()...)
-
-			snapshotResources.Set(0, snapshotResourcesMetricLabels{
-				Gateway:   cd.Gateway,
-				Namespace: cd.Namespace,
-				Resource:  "Endpoint",
-			}.toMetricsLabels()...)
-
-			snapshotResources.Set(0, snapshotResourcesMetricLabels{
-				Gateway:   cd.Gateway,
-				Namespace: cd.Namespace,
-				Resource:  "Route",
-			}.toMetricsLabels()...)
-
-			snapshotResources.Set(0, snapshotResourcesMetricLabels{
-				Gateway:   cd.Gateway,
-				Namespace: cd.Namespace,
-				Resource:  "Listener",
-			}.toMetricsLabels()...)
-
-			snapshotResources.Set(0, snapshotResourcesMetricLabels{
-				Gateway:   cd.Gateway,
-				Namespace: cd.Namespace,
-				Resource:  "Secret",
-			}.toMetricsLabels()...)
-
-		case controllers.EventAdd, controllers.EventUpdate:
-			snapshotResources.Set(float64(len(o.Latest().snap.Resources[envoycachetypes.Cluster].Items)),
-				snapshotResourcesMetricLabels{
-					Gateway:   cd.Gateway,
-					Namespace: cd.Namespace,
-					Resource:  "Cluster",
-				}.toMetricsLabels()...)
-
-			snapshotResources.Set(float64(len(o.Latest().snap.Resources[envoycachetypes.Endpoint].Items)),
-				snapshotResourcesMetricLabels{
-					Gateway:   cd.Gateway,
-					Namespace: cd.Namespace,
-					Resource:  "Endpoint",
-				}.toMetricsLabels()...)
-
-			snapshotResources.Set(float64(len(o.Latest().snap.Resources[envoycachetypes.Route].Items)),
-				snapshotResourcesMetricLabels{
-					Gateway:   cd.Gateway,
-					Namespace: cd.Namespace,
-					Resource:  "Route",
-				}.toMetricsLabels()...)
-
-			snapshotResources.Set(float64(len(o.Latest().snap.Resources[envoycachetypes.Listener].Items)),
-				snapshotResourcesMetricLabels{
-					Gateway:   cd.Gateway,
-					Namespace: cd.Namespace,
-					Resource:  "Listener",
-				}.toMetricsLabels()...)
-
-			snapshotResources.Set(float64(len(o.Latest().snap.Resources[envoycachetypes.Secret].Items)),
-				snapshotResourcesMetricLabels{
-					Gateway:   cd.Gateway,
-					Namespace: cd.Namespace,
-					Resource:  "Secret",
-				}.toMetricsLabels()...)
-		}
-	})
-
 	// Track connected clients without snapshot rows, including those still
-	// waiting for their first snapshot.
+	// waiting for their first snapshot, and publish per-gateway snapshot sizes.
 	newSnapshotDeferralTracker().register(uccCol, xdsSnapshotsForUcc)
 
 	return xdsSnapshotsForUcc

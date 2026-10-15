@@ -96,6 +96,38 @@ type resourceMetricLabels struct {
 	Resource  string
 }
 
+func init() {
+	// resourcesManaged is not scoped: adjustResourcesManaged deletes each series when its
+	// count reaches zero.
+	for _, m := range []metrics.PartialDeleter{
+		xdsSnapshotSyncsTotal, xdsSnapshotSyncDuration,
+		resourcesStatusSyncsStartedTotal, resourcesStatusSyncsCompletedTotal, resourcesStatusSyncDuration,
+	} {
+		metrics.RegisterNamespaceScoped(m, namespaceLabel)
+	}
+}
+
+// managedCounts mirrors resourcesManaged so a series can be deleted, rather than left at
+// zero, once its parent no longer has any resources.
+var managedCounts = struct {
+	sync.Mutex
+	m map[resourceMetricLabels]int
+}{m: map[resourceMetricLabels]int{}}
+
+func adjustResourcesManaged(labels resourceMetricLabels, delta int) {
+	managedCounts.Lock()
+	defer managedCounts.Unlock()
+
+	n := managedCounts.m[labels] + delta
+	if n > 0 {
+		managedCounts.m[labels] = n
+		resourcesManaged.Set(float64(n), labels.toMetricsLabels()...)
+		return
+	}
+	delete(managedCounts.m, labels)
+	resourcesManaged.DeletePartialMatch(labels.toMetricsLabels()...)
+}
+
 func (r resourceMetricLabels) toMetricsLabels() []metrics.Label {
 	return []metrics.Label{
 		{Name: parentLabel, Value: r.Parent},
@@ -133,6 +165,10 @@ type syncStartInfo struct {
 	endTime     time.Time
 	details     ResourceSyncDetails
 	xdsSnapshot bool
+	// purgeGateway drops every pending sync and series of details.Gateway in
+	// details.Namespace. It travels through syncCh, which a single goroutine drains
+	// in order, so it is applied after the end-of-sync updates queued before it.
+	purgeGateway bool
 }
 
 // Buffered channel to handle resource sync metrics updates.
@@ -333,6 +369,11 @@ func endResourceSync(syncInfo *syncStartInfo) {
 	startTimes.Lock()
 	defer startTimes.Unlock()
 
+	if syncInfo.purgeGateway {
+		purgeGatewaySyncs(syncInfo.details.Gateway, syncInfo.details.Namespace)
+		return
+	}
+
 	if startTimes.times == nil {
 		return
 	}
@@ -432,6 +473,50 @@ func endResourceSync(syncInfo *syncStartInfo) {
 	if len(startTimes.times[syncInfo.details.Gateway]) == 0 {
 		delete(startTimes.times, syncInfo.details.Gateway)
 	}
+}
+
+// enqueueGatewayPurge queues the removal of a deleted Gateway's pending syncs and series.
+// If the channel is full the purge is dropped and counted like any other dropped update.
+func enqueueGatewayPurge(gateway, namespace string) {
+	syncChLock.RLock()
+	defer syncChLock.RUnlock()
+
+	select {
+	case syncCh <- &syncStartInfo{
+		details:      ResourceSyncDetails{Gateway: gateway, Namespace: namespace},
+		purgeGateway: true,
+	}:
+	default:
+		logger.Error("resource metrics sync channel is full, dropping gateway metrics purge",
+			"gateway", gateway, "namespace", namespace)
+		resourcesUpdatesDroppedTotal.Inc()
+	}
+}
+
+// purgeGatewaySyncs drops the pending syncs recorded under gateway for resources in
+// namespace, and the series of the same gateway and namespace. Resources in other
+// namespaces that reference the Gateway keep theirs until their namespace is deleted.
+// Called with startTimes held.
+func purgeGatewaySyncs(gateway, namespace string) {
+	for rt, byNamespace := range startTimes.times[gateway] {
+		delete(byNamespace, namespace)
+		if len(byNamespace) == 0 {
+			delete(startTimes.times[gateway], rt)
+		}
+	}
+	if len(startTimes.times[gateway]) == 0 {
+		delete(startTimes.times, gateway)
+	}
+
+	labels := []metrics.Label{
+		{Name: gatewayLabel, Value: gateway},
+		{Name: namespaceLabel, Value: namespace},
+	}
+	xdsSnapshotSyncsTotal.DeletePartialMatch(labels...)
+	xdsSnapshotSyncDuration.DeletePartialMatch(labels...)
+	resourcesStatusSyncsStartedTotal.DeletePartialMatch(labels...)
+	resourcesStatusSyncsCompletedTotal.DeletePartialMatch(labels...)
+	resourcesStatusSyncDuration.DeletePartialMatch(labels...)
 }
 
 // GetResourceMetricEventHandler returns a function that handles krt events for various Gateway API resources.
@@ -585,11 +670,11 @@ func GetResourceMetricEventHandler[T any]() func(krt.Event[T]) {
 		switch eventType {
 		case controllers.EventAdd:
 			for _, name := range names {
-				resourcesManaged.Add(1, resourceMetricLabels{
+				adjustResourcesManaged(resourceMetricLabels{
 					Parent:    name,
 					Namespace: namespace,
 					Resource:  resourceType,
-				}.toMetricsLabels()...)
+				}, 1)
 
 				startResourceSync(ResourceSyncDetails{
 					Gateway:      name,
@@ -599,21 +684,22 @@ func GetResourceMetricEventHandler[T any]() func(krt.Event[T]) {
 				})
 			}
 		case controllers.EventUpdate:
+			// Apply the net change, so an update that keeps a parent does not delete
+			// and re-create its series when the count passes through zero.
+			deltas := make(map[resourceMetricLabels]int, len(namesOld)+len(names))
 			for _, name := range namesOld {
-				resourcesManaged.Sub(1, resourceMetricLabels{
-					Parent:    name,
-					Namespace: namespaceOld,
-					Resource:  resourceType,
-				}.toMetricsLabels()...)
+				deltas[resourceMetricLabels{Parent: name, Namespace: namespaceOld, Resource: resourceType}]--
+			}
+			for _, name := range names {
+				deltas[resourceMetricLabels{Parent: name, Namespace: namespace, Resource: resourceType}]++
+			}
+			for labels, delta := range deltas {
+				if delta != 0 {
+					adjustResourcesManaged(labels, delta)
+				}
 			}
 
 			for _, name := range names {
-				resourcesManaged.Add(1, resourceMetricLabels{
-					Parent:    name,
-					Namespace: namespace,
-					Resource:  resourceType,
-				}.toMetricsLabels()...)
-
 				startResourceSync(ResourceSyncDetails{
 					Gateway:      name,
 					Namespace:    namespace,
@@ -623,11 +709,11 @@ func GetResourceMetricEventHandler[T any]() func(krt.Event[T]) {
 			}
 		case controllers.EventDelete:
 			for _, name := range names {
-				resourcesManaged.Sub(1, resourceMetricLabels{
+				adjustResourcesManaged(resourceMetricLabels{
 					Parent:    name,
 					Namespace: namespace,
 					Resource:  resourceType,
-				}.toMetricsLabels()...)
+				}, -1)
 
 				startResourceSync(ResourceSyncDetails{
 					Gateway:      name,
@@ -645,6 +731,12 @@ func GetResourceMetricEventHandler[T any]() func(krt.Event[T]) {
 					ResourceName: resourceName,
 				})
 			}
+
+			// A deleted Gateway gets no further XDS sync, so its pending syncs would
+			// never end; drop them along with its series.
+			if resourceType == wellknown.GatewayKind {
+				enqueueGatewayPurge(resourceName, namespace)
+			}
 		}
 	}
 }
@@ -655,6 +747,9 @@ func ResetMetrics() {
 	xdsSnapshotSyncsTotal.Reset()
 	xdsSnapshotSyncDuration.Reset()
 	resourcesManaged.Reset()
+	managedCounts.Lock()
+	clear(managedCounts.m)
+	managedCounts.Unlock()
 	resourcesStatusSyncsStartedTotal.Reset()
 	resourcesStatusSyncsCompletedTotal.Reset()
 	resourcesStatusSyncDuration.Reset()

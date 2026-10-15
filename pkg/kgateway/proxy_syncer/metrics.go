@@ -4,7 +4,13 @@ import (
 	"strings"
 	"time"
 
+	"istio.io/istio/pkg/kube/controllers"
+	"istio.io/istio/pkg/kube/krt"
+	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
+
+	"github.com/kgateway-dev/kgateway/v2/pkg/kgateway/wellknown"
 	"github.com/kgateway-dev/kgateway/v2/pkg/metrics"
+	"github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/ir"
 )
 
 const (
@@ -58,6 +64,39 @@ var (
 		[]string{gatewayLabel, namespaceLabel},
 	)
 )
+
+func init() {
+	// The per-client series are deleted by snapshotDeferralTracker when a gateway's
+	// last client disconnects; the namespace cleanup catches a transform that ran
+	// after that.
+	metrics.RegisterNamespaceScoped(snapshotTransformsTotal, namespaceLabel)
+	metrics.RegisterNamespaceScoped(snapshotTransformDuration, namespaceLabel)
+}
+
+// gatewayMetricsCleanup returns a handler for translation output events that deletes a
+// Gateway's gateway-scoped metric series once it is gone. The series are recorded while
+// the Gateway is translated, and KRT delivers the output's delete event only after the
+// last translation has finished, so nothing re-creates them afterwards. A delete while the
+// Gateway is still present means translation returned nil and will run again; its series
+// are kept.
+func gatewayMetricsCleanup(gateways krt.Collection[ir.Gateway]) func(krt.Event[gatewayTranslationOutput]) {
+	return func(e krt.Event[gatewayTranslationOutput]) {
+		if e.Event != controllers.EventDelete {
+			return
+		}
+		nn := e.Latest().Xds.NamespacedName
+		key := ir.ObjectSource{
+			Group:     gwv1.GroupVersion.Group,
+			Kind:      wellknown.GatewayKind,
+			Namespace: nn.Namespace,
+			Name:      nn.Name,
+		}.ResourceName()
+		if gateways.GetKey(key) != nil {
+			return
+		}
+		metrics.DeleteGatewaySeries(nn.Namespace, nn.Name)
+	}
+}
 
 // snapshotResourcesMetricLabels defines the labels for XDS snapshot resources metrics.
 type snapshotResourcesMetricLabels struct {

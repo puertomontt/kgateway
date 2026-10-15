@@ -268,14 +268,20 @@ func (r *gatewayReconciler) Start(ctx context.Context) error {
 
 func (r *gatewayReconciler) Reconcile(req types.NamespacedName) (rErr error) {
 	finishMetrics := collectReconciliationMetrics("gateway", req)
+	gatewayGone := false
 	defer func() {
 		finishMetrics(rErr)
+		if gatewayGone {
+			// Recorded above, so delete only after finishing.
+			deleteReconciliationMetrics("gateway", req)
+		}
 	}()
 
 	gw := r.gwClient.Get(req.Name, req.Namespace)
 	if gw == nil || gw.GetDeletionTimestamp() != nil {
 		// ignore the event if the Gateway is not found. A subsequent event should handle this if needed
 		logger.Debug("gateway not found, skipping reconciliation", "ref", req)
+		gatewayGone = true
 		return nil
 	}
 

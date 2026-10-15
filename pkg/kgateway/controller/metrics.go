@@ -40,6 +40,12 @@ var (
 	)
 )
 
+func init() {
+	for _, m := range []metrics.PartialDeleter{reconciliationsTotal, reconcileDuration} {
+		metrics.RegisterNamespaceScoped(m, namespaceLabel)
+	}
+}
+
 // collectReconciliationMetrics is called at the start of a controller reconciliation
 // function to begin metrics collection and returns a function called at the end to
 // complete metrics recording.
@@ -71,6 +77,18 @@ func collectReconciliationMetrics(controllerName string, req types.NamespacedNam
 			metrics.Label{Name: resultLabel, Value: result},
 		)
 	}
+}
+
+// deleteReconciliationMetrics deletes the series of one reconciled object, called once it
+// no longer exists.
+func deleteReconciliationMetrics(controllerName string, req types.NamespacedName) {
+	labels := []metrics.Label{
+		{Name: controllerNameLabel, Value: controllerName},
+		{Name: nameLabel, Value: req.Name},
+		{Name: namespaceLabel, Value: req.Namespace},
+	}
+	reconciliationsTotal.DeletePartialMatch(labels...)
+	reconcileDuration.DeletePartialMatch(labels...)
 }
 
 // ResetMetrics resets the metrics from this package.

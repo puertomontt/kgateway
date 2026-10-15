@@ -78,11 +78,8 @@ func TestSingleErrorLifecycle(t *testing.T) {
 	require.NoError(t, cb.OnStreamRequest(1, dr(fullType, nil)))
 	gathered = metricstest.MustGatherMetrics(t)
 	gathered.AssertMetricsInclude("kgateway_envoy_xds_rejects_total", []metricstest.ExpectMetric{expectedCounter(1, typeURL)})
-	// Gauge metric may disappear entirely after reset to 0; we assert either absence or value 0 for our labels
-	// If present, it must have value 0 with our labels; if not present, that's acceptable
-	if gathered.MetricLength("kgateway_envoy_xds_rejects_active") > 0 {
-		gathered.AssertMetricsInclude("kgateway_envoy_xds_rejects_active", []metricstest.ExpectMetric{expectedGauge(0, typeURL)})
-	}
+	// The gauge series is deleted rather than left at 0, so resolved rejects do not accumulate.
+	gathered.AssertMetricNotExists("kgateway_envoy_xds_rejects_active")
 }
 
 func TestMultipleResourcesAndStreams(t *testing.T) {
@@ -132,12 +129,21 @@ func TestMultipleResourcesAndStreams(t *testing.T) {
 		expectedCounter(2, typeURL),
 		expectedCounter(1, typeURL2),
 	})
-	// Gauges should now either be absent or zero; if present assert zero
-	if gathered.MetricLength("kgateway_envoy_xds_rejects_active") > 0 {
-		// We allow any remaining metrics to be zero; check inclusion semantics
-		gathered.AssertMetricsInclude("kgateway_envoy_xds_rejects_active", []metricstest.ExpectMetric{
-			expectedGauge(0, typeURL),
-			expectedGauge(0, typeURL2),
-		})
-	}
+	// Closing the last stream rejecting each resource deletes its gauge series.
+	gathered.AssertMetricNotExists("kgateway_envoy_xds_rejects_active")
+}
+
+func TestRejectsTotalDeletedWithGateway(t *testing.T) {
+	resetMetrics()
+	cb := newLogNackCallback()
+
+	require.NoError(t, cb.OnStreamRequest(1, dr(fullType, &status.Status{Message: "boom"})))
+	cb.OnStreamClosed(1, nil)
+	gathered := metricstest.MustGatherMetrics(t)
+	gathered.AssertMetricsInclude("kgateway_envoy_xds_rejects_total", []metricstest.ExpectMetric{expectedCounter(1, typeURL)})
+
+	require.Equal(t, 1, kmetrics.DeleteGatewaySeries(ns, name), "the gateway's only rejects_total series")
+	gathered = metricstest.MustGatherMetrics(t)
+	// Only the empty-label series seeded by resetMetrics remains.
+	gathered.AssertMetricsLabels("kgateway_envoy_xds_rejects_total", [][]kmetrics.Label{labels("", "", "")})
 }

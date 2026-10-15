@@ -232,3 +232,15 @@ func TestIncRouteReplacementLabels(t *testing.T) {
 		},
 	))
 }
+
+func TestRoutingMetricsDeletedWithGateway(t *testing.T) {
+	domainsPerListener.Reset()
+	routeReplacementsTotal.Reset()
+
+	setDomainsPerListener(domainsPerListenerMetricLabels{Namespace: "ns", GatewayName: "gw", Port: "80"}, 2)
+	setDomainsPerListener(domainsPerListenerMetricLabels{Namespace: "ns", GatewayName: "gw", Port: "443"}, 1)
+	gw := ir.GatewayIR{SourceObject: &ir.Gateway{Obj: &gwv1.Gateway{}, ObjectSource: ir.ObjectSource{Namespace: "ns", Name: "gw"}}}
+	incRouteReplacementMetric(gw, ErrInvalidRoute)
+
+	assert.Equal(t, 3, metrics.DeleteGatewaySeries("ns", "gw"), "two listener ports plus one replacement series")
+}

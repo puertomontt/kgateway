@@ -27,6 +27,7 @@ import (
 	"github.com/kgateway-dev/kgateway/v2/pkg/kgateway/xds"
 	kmetrics "github.com/kgateway-dev/kgateway/v2/pkg/krtcollections/metrics"
 	"github.com/kgateway-dev/kgateway/v2/pkg/logging"
+	"github.com/kgateway-dev/kgateway/v2/pkg/metrics"
 	plug "github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk"
 	"github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/collections"
 	"github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/ir"
@@ -264,6 +265,7 @@ func (s *ProxySyncer) Init(ctx context.Context, krtopts krtutil.KrtOptions) {
 
 		return toTranslationOutput(gw, *xdsSnap, rm)
 	}, krtopts.ToOptions("GatewayTranslationOutputs")...)
+	metrics.RegisterEvents(translationOutputs, gatewayMetricsCleanup(s.commonCols.GatewayIndex.Gateways))
 	s.mostXdsSnapshots = krt.NewCollection(translationOutputs, func(_ krt.HandlerContext, output gatewayTranslationOutput) *GatewayXdsResources {
 		return &output.Xds
 	}, krtopts.ToOptions("MostXdsSnapshots")...)

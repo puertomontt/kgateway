@@ -38,6 +38,14 @@ var (
 	)
 )
 
+func init() {
+	// Every translator records under the Gateway being translated.
+	for _, m := range []metrics.PartialDeleter{translationsTotal, translationDuration} {
+		metrics.RegisterGatewayScoped(m, namespaceLabel, nameLabel)
+		metrics.RegisterNamespaceScoped(m, namespaceLabel)
+	}
+}
+
 type TranslatorMetricLabels struct {
 	Name       string
 	Namespace  string

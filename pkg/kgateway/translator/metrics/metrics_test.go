@@ -117,3 +117,17 @@ func TestTranslationMetricsNotActive(t *testing.T) {
 	})
 	currentMetrics.AssertMetricNotExists("kgateway_translator_translation_duration_seconds")
 }
+
+func TestTranslationMetricsDeletedWithGateway(t *testing.T) {
+	setupTest()
+
+	CollectTranslationMetrics(TranslatorMetricLabels{Name: testGatewayName, Namespace: testNamespace, Translator: testTranslatorName})(nil)
+	CollectTranslationMetrics(TranslatorMetricLabels{Name: "other", Namespace: testNamespace, Translator: testTranslatorName})(nil)
+	CollectTranslationMetrics(TranslatorMetricLabels{Name: testGatewayName, Namespace: "other-ns", Translator: testTranslatorName})(nil)
+
+	// total and duration each hold one series for the gateway.
+	assert.Equal(t, 2, metrics.DeleteGatewaySeries(testNamespace, testGatewayName))
+	assert.Zero(t, metrics.DeleteGatewaySeries(testNamespace, testGatewayName))
+	assert.Equal(t, 2, metrics.DeleteNamespaceSeries(testNamespace), "only the other gateway is left in the namespace")
+	assert.Equal(t, 2, metrics.DeleteNamespaceSeries("other-ns"))
+}

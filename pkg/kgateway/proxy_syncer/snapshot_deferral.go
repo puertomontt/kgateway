@@ -3,6 +3,8 @@ package proxy_syncer
 import (
 	"sync"
 
+	envoycachetypes "github.com/envoyproxy/go-control-plane/pkg/cache/types"
+	envoycache "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
 	"istio.io/istio/pkg/kube/controllers"
 	"istio.io/istio/pkg/kube/krt"
 
@@ -17,6 +19,12 @@ import (
 // Client and snapshot events maintain the sets and per-gateway counts in O(1)
 // per event. Gateway and namespace labels identify affected gateways without
 // adding a metric series per client.
+//
+// The tracker also owns the lifetime of every per-client xDS snapshot series
+// (resources, transforms, deferred clients): they are deleted once a gateway has
+// no connected clients, so a deleted Gateway does not leave them behind. It
+// publishes the resources gauge itself so that a snapshot event processed after
+// the last disconnect cannot resurrect a series that was already deleted.
 type snapshotDeferralTracker struct {
 	mu sync.Mutex
 	// clients is the set of connected client keys.
@@ -26,6 +34,8 @@ type snapshotDeferralTracker struct {
 	// deferred counts, per gateway label pair, the clients in clients but not
 	// in snapshots. Kept incrementally so events are O(1).
 	deferred map[resourceNameDetails]int
+	// connected counts, per gateway label pair, the clients in clients.
+	connected map[resourceNameDetails]int
 }
 
 func newSnapshotDeferralTracker() *snapshotDeferralTracker {
@@ -33,6 +43,7 @@ func newSnapshotDeferralTracker() *snapshotDeferralTracker {
 		clients:   make(map[string]struct{}),
 		snapshots: make(map[string]struct{}),
 		deferred:  make(map[resourceNameDetails]int),
+		connected: make(map[resourceNameDetails]int),
 	}
 }
 
@@ -47,17 +58,23 @@ func (d *snapshotDeferralTracker) clientEvents(events []krt.Event[ir.UniquelyCon
 	defer d.mu.Unlock()
 	for _, e := range events {
 		key := e.Latest().ResourceName()
+		gw := gatewayOf(key)
 		if e.Event == controllers.EventDelete {
 			if _, known := d.clients[key]; known {
 				delete(d.clients, key)
 				if _, has := d.snapshots[key]; !has {
 					d.adjust(key, -1)
 				}
+				if d.connected[gw]--; d.connected[gw] <= 0 {
+					delete(d.connected, gw)
+					deleteClientSnapshotMetrics(gw)
+				}
 			}
 			continue
 		}
 		if _, known := d.clients[key]; !known {
 			d.clients[key] = struct{}{}
+			d.connected[gw]++
 			if _, has := d.snapshots[key]; !has {
 				d.adjust(key, +1)
 			}
@@ -70,6 +87,7 @@ func (d *snapshotDeferralTracker) snapshotEvents(events []krt.Event[XdsSnapWrapp
 	defer d.mu.Unlock()
 	for _, e := range events {
 		key := e.Latest().ResourceName()
+		gw := gatewayOf(key)
 		if e.Event == controllers.EventDelete {
 			// A snapshot row disappears when the client disconnects, or when
 			// its transform returned nil: the deferral this gauge exists for.
@@ -79,8 +97,16 @@ func (d *snapshotDeferralTracker) snapshotEvents(events []krt.Event[XdsSnapWrapp
 					d.adjust(key, +1)
 				}
 			}
+			if d.connected[gw] == 0 {
+				// The row's final event, after the gateway's last client left.
+				// Anything recorded for it since that disconnect is stale.
+				deleteClientSnapshotMetrics(gw)
+			} else {
+				setSnapshotResources(gw, nil)
+			}
 			continue
 		}
+		setSnapshotResources(gw, e.Latest().snap)
 		if _, had := d.snapshots[key]; !had {
 			d.snapshots[key] = struct{}{}
 			if _, known := d.clients[key]; known {
@@ -92,8 +118,7 @@ func (d *snapshotDeferralTracker) snapshotEvents(events []krt.Event[XdsSnapWrapp
 
 // adjust moves one gateway's deferred count and publishes it. Called with mu held.
 func (d *snapshotDeferralTracker) adjust(clientKey string, delta int) {
-	cd := getDetailsFromXDSClientResourceName(clientKey)
-	labels := resourceNameDetails{Namespace: cd.Namespace, Gateway: cd.Gateway}
+	labels := gatewayOf(clientKey)
 	n := d.deferred[labels] + delta
 	if n <= 0 {
 		delete(d.deferred, labels)
@@ -105,6 +130,56 @@ func (d *snapshotDeferralTracker) adjust(clientKey string, delta int) {
 		metrics.Label{Name: gatewayLabel, Value: labels.Gateway},
 		metrics.Label{Name: namespaceLabel, Value: labels.Namespace},
 	)
+}
+
+// gatewayOf returns the gateway label pair of a client key.
+func gatewayOf(clientKey string) resourceNameDetails {
+	cd := getDetailsFromXDSClientResourceName(clientKey)
+	return resourceNameDetails{Namespace: cd.Namespace, Gateway: cd.Gateway}
+}
+
+// snapshotResourceTypes are the xDS types reported by the resources gauge, by label value.
+var snapshotResourceTypes = []struct {
+	label   string
+	typeIdx envoycachetypes.ResponseType
+}{
+	{"Cluster", envoycachetypes.Cluster},
+	{"Endpoint", envoycachetypes.Endpoint},
+	{"Route", envoycachetypes.Route},
+	{"Listener", envoycachetypes.Listener},
+	{"Secret", envoycachetypes.Secret},
+}
+
+// setSnapshotResources publishes a gateway's snapshot resource counts; a nil
+// snapshot publishes zeros. Called with mu held.
+func setSnapshotResources(gw resourceNameDetails, snap *envoycache.Snapshot) {
+	if !metrics.Active() {
+		return
+	}
+	for _, rt := range snapshotResourceTypes {
+		var n int
+		if snap != nil {
+			n = len(snap.Resources[rt.typeIdx].Items)
+		}
+		snapshotResources.Set(float64(n), snapshotResourcesMetricLabels{
+			Gateway:   gw.Gateway,
+			Namespace: gw.Namespace,
+			Resource:  rt.label,
+		}.toMetricsLabels()...)
+	}
+}
+
+// deleteClientSnapshotMetrics deletes every per-client snapshot series of a
+// gateway. Called with mu held once the gateway has no connected clients.
+func deleteClientSnapshotMetrics(gw resourceNameDetails) {
+	labels := []metrics.Label{
+		{Name: gatewayLabel, Value: gw.Gateway},
+		{Name: namespaceLabel, Value: gw.Namespace},
+	}
+	snapshotTransformsTotal.DeletePartialMatch(labels...)
+	snapshotTransformDuration.DeletePartialMatch(labels...)
+	snapshotResources.DeletePartialMatch(labels...)
+	snapshotDeferredClients.DeletePartialMatch(labels...)
 }
 
 // deferredClients returns the keys of connected clients that currently have no

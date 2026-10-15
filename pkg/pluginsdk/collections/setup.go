@@ -3,6 +3,7 @@ package collections
 import (
 	"context"
 
+	"istio.io/istio/pkg/kube/controllers"
 	"istio.io/istio/pkg/kube/kclient"
 	"istio.io/istio/pkg/kube/krt"
 	"istio.io/istio/pkg/kube/kubetypes"
@@ -40,6 +41,13 @@ func (c *CommonCollections) InitCollections(
 	gatewayClasses := krt.WrapClient(kclient.New[*gwv1.GatewayClass](c.Client), c.KrtOpts.ToOptions("KubeGatewayClasses")...)
 
 	namespaces, _ := krtcollections.NewNamespaceCollection(ctx, c.Client, c.KrtOpts)
+	// Kubernetes removes a Namespace only after everything in it is gone, so nothing
+	// records under it afterwards.
+	metrics.RegisterEvents(namespaces, func(e krt.Event[krtcollections.NamespaceMetadata]) {
+		if e.Event == controllers.EventDelete {
+			metrics.DeleteNamespaceSeries(e.Latest().Name)
+		}
+	})
 
 	kubeRawGateways := krt.WrapClient(kclient.NewFilteredDelayed[*gwv1.Gateway](c.Client, wellknown.GatewayGVR, filter), c.KrtOpts.ToOptions("KubeGateways")...)
 	metrics.RegisterEvents(kubeRawGateways, kmetrics.GetResourceMetricEventHandler[*gwv1.Gateway]())
