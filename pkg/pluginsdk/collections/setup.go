@@ -41,9 +41,12 @@ func (c *CommonCollections) InitCollections(
 	gatewayClasses := krt.WrapClient(kclient.New[*gwv1.GatewayClass](c.Client), c.KrtOpts.ToOptions("KubeGatewayClasses")...)
 
 	namespaces, _ := krtcollections.NewNamespaceCollection(ctx, c.Client, c.KrtOpts)
-	// Kubernetes removes a Namespace only after everything in it is gone, so nothing
-	// records under it afterwards beyond updates already queued for its resources, which
-	// kmetrics drops.
+	// Kubernetes removes a Namespace only after everything in it is gone. Updates still
+	// queued for its resources, and resource events handled after the namespace's own, are
+	// dropped by kmetrics instead of re-creating its series.
+	if metrics.Active() {
+		kmetrics.GuardNamespaces(namespaces)
+	}
 	metrics.RegisterEvents(namespaces, func(e krt.Event[krtcollections.NamespaceMetadata]) {
 		if e.Event == controllers.EventDelete {
 			kmetrics.DeleteNamespaceSeries(e.Latest().Name)

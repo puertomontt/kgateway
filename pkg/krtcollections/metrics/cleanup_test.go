@@ -11,9 +11,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 
+	"github.com/kgateway-dev/kgateway/v2/pkg/krtcollections"
 	. "github.com/kgateway-dev/kgateway/v2/pkg/krtcollections/metrics"
 	"github.com/kgateway-dev/kgateway/v2/pkg/metrics"
 	"github.com/kgateway-dev/kgateway/v2/pkg/metrics/metricstest"
+	"github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/krtutil"
 )
 
 // hasSeries reports whether the named metric has a series with exactly these label values.
@@ -223,6 +225,47 @@ func TestNamespaceDeleteDropsQueuedSyncEnds(t *testing.T) {
 		"a sync end queued before the namespace delete must not re-create its series")
 	require.False(t, hasSeries(t, "kgateway_resources_status_sync_duration_seconds", labels...),
 		"a sync end queued before the namespace delete must not re-create its series")
+}
+
+func TestResourceEventAfterNamespaceDeleteRecordsNothing(t *testing.T) {
+	setupTest()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	krtopts := krtutil.NewKrtOptions(ctx.Done(), nil)
+	namespaces := krt.NewStaticCollection[krtcollections.NamespaceMetadata](nil,
+		[]krtcollections.NamespaceMetadata{{Name: "ns"}, {Name: "other"}}, krtopts.ToOptions("Namespaces")...)
+	GuardNamespaces(namespaces)
+
+	handle := GetResourceMetricEventHandler[*gwv1.HTTPRoute]()
+	r := route("r", "gw")
+	labels := []metrics.Label{{Name: "gateway", Value: "gw"}, {Name: "namespace", Value: "ns"}}
+	handle(krt.Event[*gwv1.HTTPRoute]{New: &r, Event: controllers.EventAdd})
+	require.True(t, hasSeries(t, "kgateway_resources_status_syncs_started_total", labels...))
+
+	// The namespace's delete is handled before the route's.
+	namespaces.DeleteObject("ns")
+	DeleteNamespaceSeries("ns")
+	handle(krt.Event[*gwv1.HTTPRoute]{Old: &r, Event: controllers.EventDelete})
+
+	StartResourceSyncMetricsProcessing(ctx)
+	// The worker drains the queue in order, so once this later end is processed the
+	// route's queued end has been too.
+	other := ResourceSyncDetails{Gateway: "gw", Namespace: "other", ResourceType: "HTTPRoute", ResourceName: "r"}
+	StartResourceStatusSync(other)
+	EndResourceStatusSync(other)
+	require.Eventually(t, func() bool {
+		return hasSeries(t, "kgateway_resources_status_syncs_completed_total",
+			metrics.Label{Name: "gateway", Value: "gw"}, metrics.Label{Name: "namespace", Value: "other"})
+	}, 2*time.Second, 10*time.Millisecond)
+
+	for _, name := range []string{
+		"kgateway_resources_status_syncs_started_total",
+		"kgateway_resources_status_syncs_completed_total",
+		"kgateway_resources_status_sync_duration_seconds",
+	} {
+		require.False(t, hasSeries(t, name, labels...),
+			"%s: a resource event handled after its namespace was deleted must not re-create series", name)
+	}
 }
 
 func TestResourcesManagedUpdateKeepsSeries(t *testing.T) {

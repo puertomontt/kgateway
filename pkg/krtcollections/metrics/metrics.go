@@ -153,6 +153,8 @@ type resourceSyncStartTimes struct {
 	// are keyed by Gateway name only, so a deleted Gateway's entries can be told apart
 	// only when no other Gateway shares its name.
 	gateways map[string]map[string]struct{}
+	// namespaceGone reports whether a namespace has been deleted; nil until GuardNamespaces.
+	namespaceGone func(string) bool
 }
 
 var startTimes = &resourceSyncStartTimes{}
@@ -215,6 +217,10 @@ func StartResourceStatusSync(details ResourceSyncDetails) {
 	startTimes.Lock()
 	defer startTimes.Unlock()
 
+	if startTimes.namespaceGone != nil && startTimes.namespaceGone(details.Namespace) {
+		return
+	}
+
 	if startTimes.times == nil {
 		startTimes.times = make(map[string]map[string]map[string]map[string]ResourceSyncStartTime)
 	}
@@ -258,6 +264,10 @@ func StartResourceXDSSync(details ResourceSyncDetails) {
 
 	startTimes.Lock()
 	defer startTimes.Unlock()
+
+	if startTimes.namespaceGone != nil && startTimes.namespaceGone(details.Namespace) {
+		return
+	}
 
 	if startTimes.times == nil {
 		startTimes.times = make(map[string]map[string]map[string]map[string]ResourceSyncStartTime)
@@ -503,6 +513,24 @@ func purgeDeletedGateway(name, namespace string) bool {
 	delete(startTimes.gateways, name)
 	purgeGatewaySyncs(name, namespace)
 	return true
+}
+
+// GuardNamespaces makes sync starts for resources in a namespace that namespaces no longer
+// holds record nothing. Resource events come from informers that are not ordered with the
+// Namespace informer, so a resource's delete can be handled after its namespace's
+// DeleteNamespaceSeries and would otherwise re-create the series it deleted.
+//
+// namespaces drops a namespace before its delete handler runs DeleteNamespaceSeries, and
+// both the check and that cleanup hold startTimes, so a start either records first and is
+// cleaned up, or sees the namespace gone. Before namespaces has synced every namespace is
+// treated as live.
+func GuardNamespaces[T any](namespaces krt.Collection[T]) {
+	startTimes.Lock()
+	defer startTimes.Unlock()
+
+	startTimes.namespaceGone = func(namespace string) bool {
+		return namespace != "" && namespaces.HasSynced() && namespaces.GetKey(namespace) == nil
+	}
 }
 
 // DeleteNamespaceSeries drops the pending syncs of resources in a deleted namespace, then
@@ -796,6 +824,7 @@ func ResetMetrics() {
 	defer startTimes.Unlock()
 	startTimes.times = make(map[string]map[string]map[string]map[string]ResourceSyncStartTime)
 	startTimes.gateways = nil
+	startTimes.namespaceGone = nil
 
 	syncChLock.Lock()
 	syncCh = make(chan *syncStartInfo, 1024)
