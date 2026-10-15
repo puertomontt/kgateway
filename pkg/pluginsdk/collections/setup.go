@@ -42,10 +42,11 @@ func (c *CommonCollections) InitCollections(
 
 	namespaces, _ := krtcollections.NewNamespaceCollection(ctx, c.Client, c.KrtOpts)
 	// Kubernetes removes a Namespace only after everything in it is gone, so nothing
-	// records under it afterwards.
+	// records under it afterwards beyond updates already queued for its resources, which
+	// kmetrics drops.
 	metrics.RegisterEvents(namespaces, func(e krt.Event[krtcollections.NamespaceMetadata]) {
 		if e.Event == controllers.EventDelete {
-			metrics.DeleteNamespaceSeries(e.Latest().Name)
+			kmetrics.DeleteNamespaceSeries(e.Latest().Name)
 		}
 	})
 

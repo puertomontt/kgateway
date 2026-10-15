@@ -194,6 +194,37 @@ func TestNamespaceDeleteRemovesSyncMetrics(t *testing.T) {
 	require.False(t, hasSeries(t, "kgateway_resources_status_sync_duration_seconds", labels...))
 }
 
+func TestNamespaceDeleteDropsQueuedSyncEnds(t *testing.T) {
+	setupTest()
+	handle := GetResourceMetricEventHandler[*gwv1.HTTPRoute]()
+	r := route("r", "gw")
+	labels := []metrics.Label{{Name: "gateway", Value: "gw"}, {Name: "namespace", Value: "ns"}}
+
+	// The route delete queues the end of its status sync, which the metrics worker has
+	// not processed when the namespace is deleted.
+	handle(krt.Event[*gwv1.HTTPRoute]{New: &r, Event: controllers.EventAdd})
+	handle(krt.Event[*gwv1.HTTPRoute]{Old: &r, Event: controllers.EventDelete})
+	DeleteNamespaceSeries("ns")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	StartResourceSyncMetricsProcessing(ctx)
+	// The worker drains the queue in order, so once this later end is processed the
+	// route's queued end has been too.
+	other := ResourceSyncDetails{Gateway: "gw", Namespace: "other", ResourceType: "HTTPRoute", ResourceName: "r"}
+	StartResourceStatusSync(other)
+	EndResourceStatusSync(other)
+	require.Eventually(t, func() bool {
+		return hasSeries(t, "kgateway_resources_status_syncs_completed_total",
+			metrics.Label{Name: "gateway", Value: "gw"}, metrics.Label{Name: "namespace", Value: "other"})
+	}, 2*time.Second, 10*time.Millisecond)
+
+	require.False(t, hasSeries(t, "kgateway_resources_status_syncs_completed_total", labels...),
+		"a sync end queued before the namespace delete must not re-create its series")
+	require.False(t, hasSeries(t, "kgateway_resources_status_sync_duration_seconds", labels...),
+		"a sync end queued before the namespace delete must not re-create its series")
+}
+
 func TestResourcesManagedUpdateKeepsSeries(t *testing.T) {
 	setupTest()
 	handle := GetResourceMetricEventHandler[*gwv1.HTTPRoute]()

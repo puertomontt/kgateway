@@ -77,8 +77,9 @@ func snapshotPerClient(
 		}
 	}, krtopts.ToOptions("EndpointResources")...)
 
+	tracker := newSnapshotDeferralTracker()
 	xdsSnapshotsForUcc := krt.NewCollection(uccCol, func(kctx krt.HandlerContext, ucc ir.UniquelyConnectedClient) *XdsSnapWrapper {
-		defer (collectXDSTransformMetrics(ucc.ResourceName()))(nil)
+		defer (tracker.collectTransformMetrics(uccCol, ucc.ResourceName()))(nil)
 
 		listenerRouteSnapshot := krt.FetchOne(kctx, mostXdsSnapshots, krt.FilterKey(ucc.Role))
 		if listenerRouteSnapshot == nil {
@@ -159,7 +160,7 @@ func snapshotPerClient(
 
 	// Track connected clients without snapshot rows, including those still
 	// waiting for their first snapshot, and publish per-gateway snapshot sizes.
-	newSnapshotDeferralTracker().register(uccCol, xdsSnapshotsForUcc)
+	tracker.register(uccCol, xdsSnapshotsForUcc)
 
 	return xdsSnapshotsForUcc
 }

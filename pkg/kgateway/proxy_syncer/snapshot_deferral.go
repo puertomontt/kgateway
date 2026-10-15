@@ -132,6 +132,29 @@ func (d *snapshotDeferralTracker) adjust(clientKey string, delta int) {
 	)
 }
 
+// collectTransformMetrics wraps collectXDSTransformMetrics for a client's snapshot
+// transform so that a transform finishing after its client disconnected records nothing.
+// The tracker deletes the gateway's series when its last client disconnects, and a
+// transform that then returns nil emits no snapshot event that would delete them again.
+//
+// clients drops the client before the tracker's clientEvents sees its delete, and both
+// run under mu, so either the transform records first and that delete removes the series,
+// or the client is already gone and the transform records nothing.
+func (d *snapshotDeferralTracker) collectTransformMetrics(clients krt.Collection[ir.UniquelyConnectedClient], clientKey string) func(error) {
+	finish := collectXDSTransformMetrics(clientKey)
+	if !metrics.Active() {
+		return finish
+	}
+	return func(err error) {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		if clients.GetKey(clientKey) == nil {
+			return
+		}
+		finish(err)
+	}
+}
+
 // gatewayOf returns the gateway label pair of a client key.
 func gatewayOf(clientKey string) resourceNameDetails {
 	cd := getDetailsFromXDSClientResourceName(clientKey)

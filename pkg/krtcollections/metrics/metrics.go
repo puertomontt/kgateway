@@ -505,6 +505,28 @@ func purgeDeletedGateway(name, namespace string) bool {
 	return true
 }
 
+// DeleteNamespaceSeries drops the pending syncs of resources in a deleted namespace, then
+// deletes every namespace-scoped series of it. Dropping the pending syncs first, under the
+// same lock the metrics worker holds, makes the end-of-sync updates still queued for them
+// record nothing, so they cannot re-create the series once deleted.
+func DeleteNamespaceSeries(namespace string) {
+	startTimes.Lock()
+	for gateway, byType := range startTimes.times {
+		for rt, byNamespace := range byType {
+			delete(byNamespace, namespace)
+			if len(byNamespace) == 0 {
+				delete(byType, rt)
+			}
+		}
+		if len(byType) == 0 {
+			delete(startTimes.times, gateway)
+		}
+	}
+	startTimes.Unlock()
+
+	metrics.DeleteNamespaceSeries(namespace)
+}
+
 // purgeGatewaySyncs drops the pending syncs recorded under gateway for resources in
 // namespace, and the series of the same gateway and namespace. Resources in other
 // namespaces that reference the Gateway keep theirs until their namespace is deleted.

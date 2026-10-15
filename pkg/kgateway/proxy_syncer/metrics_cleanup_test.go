@@ -203,3 +203,27 @@ func TestGatewayDeleteMetricsCleanupWithoutOutput(t *testing.T) {
 	require.Equal(t, 1, count("translated"), "a Gateway with an output is cleaned up by that output's delete event")
 	require.Zero(t, count("untranslated"), "a deleted Gateway whose last translation returned nil loses its series")
 }
+
+func TestTransformFinishingAfterDisconnectRecordsNothing(t *testing.T) {
+	setupTest()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	krtopts := krtutil.NewKrtOptions(ctx.Done(), nil)
+
+	role := xds.OwnerNamespaceNameID(wellknown.GatewayApiProxyValue, "ns", "gw")
+	a := ir.NewUniquelyConnectedClient(role, "ns", map[string]string{"pod": "a"}, ir.PodLocality{})
+	clients := krt.NewStaticCollection[ir.UniquelyConnectedClient](nil, []ir.UniquelyConnectedClient{a}, krtopts.ToOptions("Clients")...)
+	d := newSnapshotDeferralTracker()
+	d.clientEvents([]krt.Event[ir.UniquelyConnectedClient]{{New: &a, Event: controllers.EventAdd}})
+
+	d.collectTransformMetrics(clients, a.ResourceName())(nil)
+	require.NotEmpty(t, clientSeries(t, "gw", "ns"), "a connected client's transform records its series")
+
+	// The client disconnects while its next transform runs; that transform returns nil,
+	// so no snapshot event follows.
+	finish := d.collectTransformMetrics(clients, a.ResourceName())
+	clients.DeleteObject(a.ResourceName())
+	d.clientEvents([]krt.Event[ir.UniquelyConnectedClient]{{Old: &a, Event: controllers.EventDelete}})
+	finish(nil)
+	require.Empty(t, clientSeries(t, "gw", "ns"), "a transform finishing after the last disconnect must not re-create series")
+}
