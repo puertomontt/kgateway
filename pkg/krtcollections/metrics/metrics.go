@@ -149,6 +149,10 @@ type ResourceSyncStartTime struct {
 type resourceSyncStartTimes struct {
 	sync.RWMutex
 	times map[string]map[string]map[string]map[string]ResourceSyncStartTime
+	// gateways holds the namespaces of the live Gateways, by name. times and the series
+	// are keyed by Gateway name only, so a deleted Gateway's entries can be told apart
+	// only when no other Gateway shares its name.
+	gateways map[string]map[string]struct{}
 }
 
 var startTimes = &resourceSyncStartTimes{}
@@ -165,10 +169,6 @@ type syncStartInfo struct {
 	endTime     time.Time
 	details     ResourceSyncDetails
 	xdsSnapshot bool
-	// purgeGateway drops every pending sync and series of details.Gateway in
-	// details.Namespace. It travels through syncCh, which a single goroutine drains
-	// in order, so it is applied after the end-of-sync updates queued before it.
-	purgeGateway bool
 }
 
 // Buffered channel to handle resource sync metrics updates.
@@ -369,11 +369,6 @@ func endResourceSync(syncInfo *syncStartInfo) {
 	startTimes.Lock()
 	defer startTimes.Unlock()
 
-	if syncInfo.purgeGateway {
-		purgeGatewaySyncs(syncInfo.details.Gateway, syncInfo.details.Namespace)
-		return
-	}
-
 	if startTimes.times == nil {
 		return
 	}
@@ -475,22 +470,39 @@ func endResourceSync(syncInfo *syncStartInfo) {
 	}
 }
 
-// enqueueGatewayPurge queues the removal of a deleted Gateway's pending syncs and series.
-// If the channel is full the purge is dropped and counted like any other dropped update.
-func enqueueGatewayPurge(gateway, namespace string) {
-	syncChLock.RLock()
-	defer syncChLock.RUnlock()
+// trackGateway records a live Gateway.
+func trackGateway(name, namespace string) {
+	startTimes.Lock()
+	defer startTimes.Unlock()
 
-	select {
-	case syncCh <- &syncStartInfo{
-		details:      ResourceSyncDetails{Gateway: gateway, Namespace: namespace},
-		purgeGateway: true,
-	}:
-	default:
-		logger.Error("resource metrics sync channel is full, dropping gateway metrics purge",
-			"gateway", gateway, "namespace", namespace)
-		resourcesUpdatesDroppedTotal.Inc()
+	if startTimes.gateways == nil {
+		startTimes.gateways = map[string]map[string]struct{}{}
 	}
+	if startTimes.gateways[name] == nil {
+		startTimes.gateways[name] = map[string]struct{}{}
+	}
+	startTimes.gateways[name][namespace] = struct{}{}
+}
+
+// purgeDeletedGateway forgets a deleted Gateway and drops its pending syncs and series,
+// unless another live Gateway has the same name: entries recorded under that name could
+// then belong to either, so they are kept, and that Gateway's XDS syncs end them. It
+// returns whether it purged.
+//
+// It runs synchronously, so a Gateway recreated under the same name starts its syncs
+// after the purge. End-of-sync updates still queued for the deleted Gateway find no
+// pending sync and record nothing.
+func purgeDeletedGateway(name, namespace string) bool {
+	startTimes.Lock()
+	defer startTimes.Unlock()
+
+	delete(startTimes.gateways[name], namespace)
+	if len(startTimes.gateways[name]) > 0 {
+		return false
+	}
+	delete(startTimes.gateways, name)
+	purgeGatewaySyncs(name, namespace)
+	return true
 }
 
 // purgeGatewaySyncs drops the pending syncs recorded under gateway for resources in
@@ -669,6 +681,9 @@ func GetResourceMetricEventHandler[T any]() func(krt.Event[T]) {
 
 		switch eventType {
 		case controllers.EventAdd:
+			if resourceType == wellknown.GatewayKind {
+				trackGateway(resourceName, namespace)
+			}
 			for _, name := range names {
 				adjustResourcesManaged(resourceMetricLabels{
 					Parent:    name,
@@ -708,12 +723,18 @@ func GetResourceMetricEventHandler[T any]() func(krt.Event[T]) {
 				})
 			}
 		case controllers.EventDelete:
+			// A deleted Gateway gets no further XDS sync, so its pending syncs would never
+			// end; drop them along with its series rather than starting another.
+			purged := resourceType == wellknown.GatewayKind && purgeDeletedGateway(resourceName, namespace)
 			for _, name := range names {
 				adjustResourcesManaged(resourceMetricLabels{
 					Parent:    name,
 					Namespace: namespace,
 					Resource:  resourceType,
 				}, -1)
+				if purged {
+					continue
+				}
 
 				startResourceSync(ResourceSyncDetails{
 					Gateway:      name,
@@ -730,12 +751,6 @@ func GetResourceMetricEventHandler[T any]() func(krt.Event[T]) {
 					ResourceType: resourceType,
 					ResourceName: resourceName,
 				})
-			}
-
-			// A deleted Gateway gets no further XDS sync, so its pending syncs would
-			// never end; drop them along with its series.
-			if resourceType == wellknown.GatewayKind {
-				enqueueGatewayPurge(resourceName, namespace)
 			}
 		}
 	}
@@ -758,6 +773,7 @@ func ResetMetrics() {
 	startTimes.Lock()
 	defer startTimes.Unlock()
 	startTimes.times = make(map[string]map[string]map[string]map[string]ResourceSyncStartTime)
+	startTimes.gateways = nil
 
 	syncChLock.Lock()
 	syncCh = make(chan *syncStartInfo, 1024)

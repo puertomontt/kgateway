@@ -6,6 +6,7 @@ import (
 
 	"istio.io/istio/pkg/kube/controllers"
 	"istio.io/istio/pkg/kube/krt"
+	"k8s.io/apimachinery/pkg/types"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	"github.com/kgateway-dev/kgateway/v2/pkg/kgateway/wellknown"
@@ -92,6 +93,24 @@ func gatewayMetricsCleanup(gateways krt.Collection[ir.Gateway]) func(krt.Event[g
 			Name:      nn.Name,
 		}.ResourceName()
 		if gateways.GetKey(key) != nil {
+			return
+		}
+		metrics.DeleteGatewaySeries(nn.Namespace, nn.Name)
+	}
+}
+
+// gatewayDeleteMetricsCleanup returns a handler for Gateway events that deletes a deleted
+// Gateway's gateway-scoped series when it has no translation output. Its last translation
+// then returned nil, so gatewayMetricsCleanup kept its series and gets no further event for
+// it. When an output is still present, its delete event triggers gatewayMetricsCleanup.
+func gatewayDeleteMetricsCleanup(outputs krt.Collection[gatewayTranslationOutput]) func(krt.Event[ir.Gateway]) {
+	return func(e krt.Event[ir.Gateway]) {
+		if e.Event != controllers.EventDelete {
+			return
+		}
+		gw := e.Latest()
+		nn := types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}
+		if outputs.GetKey(GatewayXdsResources{NamespacedName: nn}.ResourceName()) != nil {
 			return
 		}
 		metrics.DeleteGatewaySeries(nn.Namespace, nn.Name)

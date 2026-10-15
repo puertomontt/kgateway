@@ -266,6 +266,7 @@ func (s *ProxySyncer) Init(ctx context.Context, krtopts krtutil.KrtOptions) {
 		return toTranslationOutput(gw, *xdsSnap, rm)
 	}, krtopts.ToOptions("GatewayTranslationOutputs")...)
 	metrics.RegisterEvents(translationOutputs, gatewayMetricsCleanup(s.commonCols.GatewayIndex.Gateways))
+	metrics.RegisterEvents(s.commonCols.GatewayIndex.Gateways, gatewayDeleteMetricsCleanup(translationOutputs))
 	s.mostXdsSnapshots = krt.NewCollection(translationOutputs, func(_ krt.HandlerContext, output gatewayTranslationOutput) *GatewayXdsResources {
 		return &output.Xds
 	}, krtopts.ToOptions("MostXdsSnapshots")...)

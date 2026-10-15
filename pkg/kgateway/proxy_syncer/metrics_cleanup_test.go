@@ -171,3 +171,35 @@ func TestGatewayMetricsCleanupSkipsLiveGateways(t *testing.T) {
 	require.Equal(t, 1, count("live"), "a Gateway whose translation returned nil keeps its series")
 	require.Zero(t, count("gone"), "a deleted Gateway's series are removed")
 }
+
+func TestGatewayDeleteMetricsCleanupWithoutOutput(t *testing.T) {
+	setupTest()
+	tmetrics.ResetMetrics()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	krtopts := krtutil.NewKrtOptions(ctx.Done(), nil)
+
+	translated := gatewayTranslationOutput{Xds: GatewayXdsResources{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "translated"}}}
+	outputs := krt.NewStaticCollection[gatewayTranslationOutput](nil, []gatewayTranslationOutput{translated}, krtopts.ToOptions("Outputs")...)
+	cleanup := gatewayDeleteMetricsCleanup(outputs)
+
+	gateway := func(name string) *ir.Gateway {
+		return &ir.Gateway{
+			ObjectSource: ir.ObjectSource{Group: gwv1.GroupVersion.Group, Kind: wellknown.GatewayKind, Namespace: "ns", Name: name},
+			Obj:          &gwv1.Gateway{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: name}},
+		}
+	}
+	count := func(name string) int {
+		return seriesCount(t, "kgateway_translator_translations_total",
+			metrics.Label{Name: "namespace", Value: "ns"}, metrics.Label{Name: "name", Value: name})
+	}
+	for _, name := range []string{"translated", "untranslated"} {
+		tmetrics.CollectTranslationMetrics(tmetrics.TranslatorMetricLabels{Name: name, Namespace: "ns", Translator: "TranslateGateway"})(nil)
+	}
+
+	cleanup(krt.Event[ir.Gateway]{Old: gateway("translated"), Event: controllers.EventDelete})
+	cleanup(krt.Event[ir.Gateway]{Old: gateway("untranslated"), Event: controllers.EventDelete})
+
+	require.Equal(t, 1, count("translated"), "a Gateway with an output is cleaned up by that output's delete event")
+	require.Zero(t, count("untranslated"), "a deleted Gateway whose last translation returned nil loses its series")
+}

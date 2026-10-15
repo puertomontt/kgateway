@@ -121,6 +121,59 @@ func TestGatewayDeletePurgesSyncMetrics(t *testing.T) {
 		"the purge must drop the pending XDS sync the delete started")
 }
 
+func TestGatewayRecreatedKeepsItsSyncs(t *testing.T) {
+	setupTest()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	StartResourceSyncMetricsProcessing(ctx)
+
+	handle := GetResourceMetricEventHandler[*gwv1.Gateway]()
+	gw := &gwv1.Gateway{ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "ns"}}
+	details := ResourceSyncDetails{Gateway: "gw", Namespace: "ns", ResourceType: "Gateway", ResourceName: "gw"}
+	labels := []metrics.Label{{Name: "gateway", Value: "gw"}, {Name: "namespace", Value: "ns"}}
+
+	handle(krt.Event[*gwv1.Gateway]{New: &gw, Event: controllers.EventAdd})
+	handle(krt.Event[*gwv1.Gateway]{Old: &gw, Event: controllers.EventDelete})
+	handle(krt.Event[*gwv1.Gateway]{New: &gw, Event: controllers.EventAdd})
+	require.True(t, hasSeries(t, "kgateway_resources_status_syncs_started_total", labels...),
+		"the purge of the deleted Gateway must not remove the recreated Gateway's series")
+
+	EndResourceXDSSync(details)
+	require.Eventually(t, func() bool {
+		return hasSeries(t, "kgateway_xds_snapshot_syncs_total", labels...)
+	}, 2*time.Second, 10*time.Millisecond, "the recreated Gateway's pending XDS sync must survive the purge")
+}
+
+func TestGatewayDeleteKeepsSyncsOfSameNameGateway(t *testing.T) {
+	setupTest()
+	handleGw := GetResourceMetricEventHandler[*gwv1.Gateway]()
+	handleRoute := GetResourceMetricEventHandler[*gwv1.HTTPRoute]()
+	local := &gwv1.Gateway{ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "ns"}}
+	other := &gwv1.Gateway{ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "other"}}
+	// The route in ns could be attached to either Gateway: series do not carry the
+	// parent's namespace.
+	r := route("r", "gw")
+	routeLabels := []metrics.Label{
+		{Name: "gateway", Value: "gw"},
+		{Name: "namespace", Value: "ns"},
+		{Name: "resource", Value: "HTTPRoute"},
+	}
+
+	handleGw(krt.Event[*gwv1.Gateway]{New: &local, Event: controllers.EventAdd})
+	handleGw(krt.Event[*gwv1.Gateway]{New: &other, Event: controllers.EventAdd})
+	handleRoute(krt.Event[*gwv1.HTTPRoute]{New: &r, Event: controllers.EventAdd})
+
+	handleGw(krt.Event[*gwv1.Gateway]{Old: &local, Event: controllers.EventDelete})
+	require.True(t, hasSeries(t, "kgateway_resources_status_syncs_started_total", routeLabels...),
+		"a Gateway sharing the deleted one's name keeps the series it may own")
+
+	handleGw(krt.Event[*gwv1.Gateway]{Old: &other, Event: controllers.EventDelete})
+	handleGw(krt.Event[*gwv1.Gateway]{New: &local, Event: controllers.EventAdd})
+	handleGw(krt.Event[*gwv1.Gateway]{Old: &local, Event: controllers.EventDelete})
+	require.False(t, hasSeries(t, "kgateway_resources_status_syncs_started_total", routeLabels...),
+		"the last Gateway of a name purges its namespace's series")
+}
+
 func TestNamespaceDeleteRemovesSyncMetrics(t *testing.T) {
 	setupTest()
 	ctx, cancel := context.WithCancel(context.Background())
