@@ -376,19 +376,19 @@ func (h *httpRouteConfigurationTranslator) envoyRoutes(
 	}
 
 	backendConfigCtx := backendConfigContext{typedPerFilterConfigRoute: ir.TypedFilterConfigMap(map[string]proto.Message{})}
-	var backendPolicyErr error
+	var backendErr error
 	if len(in.Backends) == 1 {
 		// If there's only one backend, we need to reuse typedPerFilterConfigRoute in both translateRouteAction and runRoutePlugins
-		out.Action, backendPolicyErr = h.translateRouteAction(in, out, &backendConfigCtx)
+		out.Action, backendErr = h.translateRouteAction(in, out, &backendConfigCtx)
 	} else if len(in.Backends) > 0 {
 		// If there is more than one backend, we translate the backends as WeightedClusters and each weighted cluster
 		// will have a TypedPerFilterConfig that overrides the parent route-level config.
-		out.Action, backendPolicyErr = h.translateRouteAction(in, out, nil)
+		out.Action, backendErr = h.translateRouteAction(in, out, nil)
 	}
 
 	// Run plugins here that may set action. Handle the routeProcessingErr error later.
-	// Backend policy errors are joined so the route fails closed, like route-level policy errors.
-	routeProcessingErr := errors.Join(backendPolicyErr, h.runRoutePlugins(in, out, backendConfigCtx.typedPerFilterConfigRoute))
+	// Backend and backend policy errors are joined so the route fails closed, like route-level policy errors.
+	routeProcessingErr := errors.Join(backendErr, h.runRoutePlugins(in, out, backendConfigCtx.typedPerFilterConfigRoute))
 
 	// Apply typed per filter config from translating route action and route plugins
 	typedPerFilterConfig := backendConfigCtx.typedPerFilterConfigRoute.ToAnyMap()
@@ -980,7 +980,6 @@ func (h *httpRouteConfigurationTranslator) runBackend(in ir.HttpBackend, pCtx *i
 		}
 		errs = append(errs, h.runBackendObjectPolicies(in.Backend.BackendObject, pCtx))
 	}
-	// TODO: check return value, if error returned, log error and report condition
 	return errors.Join(errs...)
 }
 
@@ -1036,7 +1035,7 @@ func (h *httpRouteConfigurationTranslator) translateRouteAction(
 	parentBackendConfigCtx *backendConfigContext,
 ) (*envoyroutev3.Route_Route, error) {
 	var clusters []*envoyroutev3.WeightedCluster_ClusterWeight
-	var backendPolicyErrs []error
+	var backendErrs []error
 	for _, backend := range in.Backends {
 		clusterName := backend.Backend.ClusterName
 
@@ -1069,8 +1068,7 @@ func (h *httpRouteConfigurationTranslator) translateRouteAction(
 			outRoute,
 		)
 		if err != nil {
-			// TODO: error on status
-			h.logger.Error("error processing backends", "error", err)
+			backendErrs = append(backendErrs, err)
 		}
 		err = h.runBackendPolicies(
 			backend,
@@ -1078,7 +1076,7 @@ func (h *httpRouteConfigurationTranslator) translateRouteAction(
 			&pCtx,
 		)
 		if err != nil {
-			backendPolicyErrs = append(backendPolicyErrs, err)
+			backendErrs = append(backendErrs, err)
 		}
 
 		backendConfigCtx.RequestHeadersToAdd = pCtx.RequestHeadersToAdd
@@ -1140,7 +1138,7 @@ func (h *httpRouteConfigurationTranslator) translateRouteAction(
 			}
 		}
 	}
-	return routeAction, errors.Join(backendPolicyErrs...)
+	return routeAction, errors.Join(backendErrs...)
 }
 
 // creates Envoy routes for each matcher provided on our Gateway route
