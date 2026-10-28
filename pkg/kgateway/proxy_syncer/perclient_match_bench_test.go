@@ -2,7 +2,6 @@ package proxy_syncer
 
 import (
 	"fmt"
-	"maps"
 	"strconv"
 	"testing"
 	"time"
@@ -165,19 +164,16 @@ func newMatchBenchFixture(extras, gaps bool) *matchBenchFixture {
 // once they are fetched, with scoping off and no bootstrap local cluster.
 func matchBenchAssemble(row *clustersWithErrors, eds *endpointsWithUccName, gw *GatewayXdsResources) matchBenchResult {
 	clusterResources := row.clusters
+	memo := row.matchMemo
 	if len(gw.Clusters) > 0 {
-		clustersProto := make(map[string]envoycachetypes.ResourceWithTTL, len(gw.Clusters)+len(clusterResources.Items))
-		maps.Copy(clustersProto, clusterResources.Items)
-		for _, item := range gw.Clusters {
-			clustersProto[envoycache.GetResourceName(item.Resource)] = item
-		}
 		clusterResources.Version = strconv.FormatUint(row.clustersHash^gw.ClustersHash, 10)
-		clusterResources.Items = clustersProto
 	}
+	clusterResources.Items = memo.mergeClusters(clusterResources.Items, gw.Clusters, gw.ClustersHash)
 	referenced := withBackendListenerRoutingTargets(gw.ReferencedClusters, row.backendListeners)
-	missingClusters := findMissingReferencedClusters(referenced, clusterResources.Items, row.erroredClusters)
-	endpointRes, endpointHashes, synthesized := filterEndpointResourcesForClusters(clusterResources, eds.endpoints, eds.rowHashes, "")
-	missingEndpointClusters := findMissingReferencedEndpointResources(referenced, clusterResources.Items, synthesized, row.erroredClusters)
+	missingClusters := memo.missingReferencedClusters(referenced, clusterResources.Items, row.erroredClusters)
+	demand := memo.edsDemand(clusterResources.Items)
+	endpointRes, endpointHashes, synthesized := memo.filterEndpoints(demand, eds.endpoints, eds.rowHashes, "")
+	missingEndpointClusters := findMissingReferencedEndpointResources(referenced, demand, synthesized, row.erroredClusters)
 	return matchBenchResult{
 		clusters:                 clusterResources,
 		endpoints:                endpointRes,
@@ -190,6 +186,7 @@ func matchBenchAssemble(row *clustersWithErrors, eds *endpointsWithUccName, gw *
 
 // matchBenchFreshRow stands in for the cluster transform storing a new row.
 func matchBenchFreshRow(row *clustersWithErrors) *clustersWithErrors {
+	row.matchMemo = new(snapshotMatchMemo)
 	return row
 }
 

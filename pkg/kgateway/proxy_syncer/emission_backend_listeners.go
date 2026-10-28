@@ -99,6 +99,9 @@ func withBackendListenerRoutingTargets(
 	referenced map[string]struct{},
 	backendListeners map[string]baseResources[*envoylistenerv3.Listener],
 ) map[string]struct{} {
+	if len(backendListeners) == 0 {
+		return referenced
+	}
 	var pending []string
 	for name := range referenced {
 		if _, ok := backendListeners[name]; ok {

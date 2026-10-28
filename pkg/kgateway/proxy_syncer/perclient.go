@@ -155,19 +155,17 @@ func snapshotPerClient(
 			// Known to be empty, unlike an unset field.
 			snap.translatedClusters = map[string]envoycachetypes.ResourceWithTTL{}
 		}
+		// The matching below is memoized on the cluster row, so a run redoes
+		// only the walks whose inputs changed (snapshotMatchMemo).
+		matchMemo := clustersForUcc.matchMemo
 		if len(listenerRouteSnapshot.Clusters) > 0 {
-			clustersProto := make(map[string]envoycachetypes.ResourceWithTTL, len(listenerRouteSnapshot.Clusters)+len(clusterResources.Items))
-			maps.Copy(clustersProto, clusterResources.Items)
-			for _, item := range listenerRouteSnapshot.Clusters {
-				clustersProto[envoycache.GetResourceName(item.Resource)] = item
-			}
 			clusterResources.Version = strconv.FormatUint(clustersHash^listenerRouteSnapshot.ClustersHash, 10)
-			clusterResources.Items = clustersProto
 		}
+		clusterResources.Items = matchMemo.mergeClusters(clusterResources.Items, listenerRouteSnapshot.Clusters, listenerRouteSnapshot.ClustersHash)
 		// A referenced backend's own listeners route on to clusters no gateway
 		// route names (a CONNECT tunnel's proxy), so its routes wait for those too.
 		referenced := withBackendListenerRoutingTargets(listenerRouteSnapshot.ReferencedClusters, clustersForUcc.backendListeners)
-		missingClusters := findMissingReferencedClusters(
+		missingClusters := matchMemo.missingReferencedClusters(
 			referenced,
 			clusterResources.Items,
 			clustersForUcc.erroredClusters,
@@ -180,12 +178,13 @@ func snapshotPerClient(
 		if ucc.KnowsLocalCluster {
 			bootstrapEndpoint, _, _ = ucc.LocalClusterInfo()
 		}
-		endpointRes, endpointHashes, synthesizedEndpoints := filterEndpointResourcesForClusters(clusterResources, clientEndpointResources.endpoints, clientEndpointResources.rowHashes, bootstrapEndpoint)
+		demand := matchMemo.edsDemand(clusterResources.Items)
+		endpointRes, endpointHashes, synthesizedEndpoints := matchMemo.filterEndpoints(demand, clientEndpointResources.endpoints, clientEndpointResources.rowHashes, bootstrapEndpoint)
 		// Every EDS cluster now has a CLA; synthesized ones mark underived rows.
 		// A derived empty CLA is not a gap.
 		missingEndpointClusters := findMissingReferencedEndpointResources(
 			referenced,
-			clusterResources.Items,
+			demand,
 			synthesizedEndpoints,
 			clustersForUcc.erroredClusters,
 		)
@@ -412,7 +411,8 @@ func findMissingReferencedClusters(
 ) []string {
 	erroredClusterSet := stringSet(erroredClusters)
 
-	missingClusters := make([]string, 0, len(referencedClusters))
+	// Usually none are missing, so this does not reserve one per reference.
+	missingClusters := make([]string, 0)
 	for name := range referencedClusters {
 		if _, ok := clusters[name]; ok {
 			continue
@@ -436,35 +436,41 @@ func findMissingReferencedClusters(
 // Service, even ExternalName, derives a row per resolvable port), or a plugin
 // never supplies one. A derived empty CLA is known truth and must not defer:
 // scale-to-zero and crashlooping backends are steady states (#14352).
+//
+// It walks the placeholders and the clusters requesting them, not the
+// referenced clusters: there are far fewer.
 func findMissingReferencedEndpointResources(
 	referencedClusters map[string]struct{},
-	clusters map[string]envoycachetypes.ResourceWithTTL,
+	demand edsDemand,
 	synthesizedEndpoints map[string]struct{},
 	erroredClusters []string,
 ) []string {
+	missingEndpointClusters := make([]string, 0, len(synthesizedEndpoints))
+	if len(synthesizedEndpoints) == 0 {
+		return missingEndpointClusters
+	}
 	erroredClusterSet := stringSet(erroredClusters)
-
-	missingEndpointClusters := make([]string, 0, len(referencedClusters))
-	for name := range referencedClusters {
+	add := func(name string) {
+		if _, ok := referencedClusters[name]; !ok {
+			return
+		}
 		if _, ok := erroredClusterSet[name]; ok {
-			continue
+			return
 		}
 		if name == wellknown.BlackholeClusterName {
-			continue
-		}
-
-		clusterResource, ok := clusters[name]
-		if !ok {
-			continue
-		}
-		endpointResourceName, requiresEndpointResource := endpointResourceNameForCluster(clusterResource)
-		if !requiresEndpointResource {
-			continue
-		}
-		if _, synthesized := synthesizedEndpoints[endpointResourceName]; !synthesized {
-			continue
+			return
 		}
 		missingEndpointClusters = append(missingEndpointClusters, name)
+	}
+	for name := range synthesizedEndpoints {
+		if demand.requestsOwn(name) {
+			add(name)
+		}
+	}
+	for name, endpointName := range demand.aliases {
+		if _, synthesized := synthesizedEndpoints[endpointName]; synthesized {
+			add(name)
+		}
 	}
 	slices.Sort(missingEndpointClusters)
 
@@ -494,50 +500,56 @@ func stringSet(values []string) map[string]struct{} {
 	return out
 }
 
-// filterEndpointResourcesForClusters keeps only the CLAs that CDS's EDS clusters
-// name, plus bootstrapEndpoint's (the bootstrap local cluster, not in dynamic
-// CDS): Envoy never requests the others, and an ADS cache withholds a whole
-// response carrying one (#14471; newSnapshotCache serves EDS per request since
-// #14865). It adds an empty CLA for each EDS cluster without one and returns
-// their names; the gate decides which reach the client
+// filterEndpointResources keeps only the CLAs that CDS's EDS clusters request
+// (demand), plus bootstrapEndpoint's (the bootstrap local cluster, not in
+// dynamic CDS): Envoy never requests the others, and an ADS cache withholds a
+// whole response carrying one (#14471; newSnapshotCache serves EDS per request
+// since #14865). It adds an empty CLA for each EDS cluster without one and
+// returns their names; the gate decides which reach the client
 // (settleSynthesizedEndpoints), since an empty CLA replaces held endpoints. The
 // returned hashes version only the published set.
-func filterEndpointResourcesForClusters(clusters envoycache.Resources, endpoints envoycache.Resources, rowHashes map[string]uint64, bootstrapEndpoint string) (envoycache.Resources, map[string]uint64, map[string]struct{}) {
-	if endpointsMatchClusters(clusters, endpoints, bootstrapEndpoint) {
+func filterEndpointResources(demand edsDemand, endpoints envoycache.Resources, rowHashes map[string]uint64, bootstrapEndpoint string) (envoycache.Resources, map[string]uint64, map[string]struct{}) {
+	if endpointsMatchClusters(demand, endpoints, bootstrapEndpoint) {
 		return endpoints, rowHashes, nil
 	}
-	requiredEndpointNames := make(map[string]struct{}, len(clusters.Items)+1)
-	for _, item := range clusters.Items {
-		if endpointName, requiresEndpointResource := endpointResourceNameForCluster(item); requiresEndpointResource {
-			requiredEndpointNames[endpointName] = struct{}{}
-		}
+	required := func(name string) bool {
+		return (bootstrapEndpoint != "" && name == bootstrapEndpoint) || demand.requires(name)
 	}
-	if bootstrapEndpoint != "" {
-		requiredEndpointNames[bootstrapEndpoint] = struct{}{}
-	}
-	covered := make(map[string]struct{}, len(requiredEndpointNames))
+	covered := make(map[string]struct{}, len(endpoints.Items))
 	filteredEndpoints := make([]envoycachetypes.ResourceWithTTL, 0, len(endpoints.Items))
 	for _, item := range endpoints.Items {
 		cla, ok := item.Resource.(*envoyendpointv3.ClusterLoadAssignment)
 		if !ok {
 			continue
 		}
-		if _, required := requiredEndpointNames[cla.GetClusterName()]; !required {
+		if !required(cla.GetClusterName()) {
 			continue
 		}
 		filteredEndpoints = append(filteredEndpoints, item)
 		covered[cla.GetClusterName()] = struct{}{}
 	}
 	var synthesized map[string]struct{}
-	for name := range requiredEndpointNames {
+	synthesize := func(name string) {
 		if _, ok := covered[name]; ok {
-			continue
+			return
 		}
 		if synthesized == nil {
 			synthesized = make(map[string]struct{})
 		}
 		filteredEndpoints = append(filteredEndpoints, envoycachetypes.ResourceWithTTL{Resource: &envoyendpointv3.ClusterLoadAssignment{ClusterName: name}})
 		synthesized[name] = struct{}{}
+		covered[name] = struct{}{}
+	}
+	for name := range demand.clusters {
+		if demand.requestsOwn(name) {
+			synthesize(name)
+		}
+	}
+	for name := range demand.aliasTargets {
+		synthesize(name)
+	}
+	if bootstrapEndpoint != "" {
+		synthesize(bootstrapEndpoint)
 	}
 	if len(synthesized) == 0 && len(filteredEndpoints) == len(endpoints.Items) {
 		return endpoints, rowHashes, nil
@@ -551,18 +563,11 @@ func filterEndpointResourcesForClusters(clusters envoycache.Resources, endpoints
 // CLA per EDS cluster plus bootstrapEndpoint, and nothing to filter or
 // synthesize. It returns false on anything unusual, such as a service_name
 // alias, leaving it to the general path.
-func endpointsMatchClusters(clusters envoycache.Resources, endpoints envoycache.Resources, bootstrapEndpoint string) bool {
-	required := 0
-	for name, item := range clusters.Items {
-		endpointName, requiresEndpointResource := endpointResourceNameForCluster(item)
-		if !requiresEndpointResource {
-			continue
-		}
-		if endpointName != name || endpointName == bootstrapEndpoint {
-			return false
-		}
-		required++
+func endpointsMatchClusters(demand edsDemand, endpoints envoycache.Resources, bootstrapEndpoint string) bool {
+	if len(demand.aliases) > 0 || demand.requestsOwn(bootstrapEndpoint) {
+		return false
 	}
+	required := len(demand.clusters) - len(demand.unrequested)
 	if bootstrapEndpoint != "" {
 		required++
 	}
@@ -576,11 +581,7 @@ func endpointsMatchClusters(clusters envoycache.Resources, endpoints envoycache.
 		if bootstrapEndpoint != "" && name == bootstrapEndpoint {
 			continue
 		}
-		cluster, ok := clusters.Items[name]
-		if !ok {
-			return false
-		}
-		if _, requiresEndpointResource := endpointResourceNameForCluster(cluster); !requiresEndpointResource {
+		if !demand.requestsOwn(name) {
 			return false
 		}
 	}

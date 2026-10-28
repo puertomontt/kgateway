@@ -198,6 +198,10 @@ type clustersWithErrors struct {
 	// per client.
 	perClientErrors []uccWithCluster
 	resourceName    string
+	// matchMemo keeps what the snapshot transform derived from this payload, so
+	// it lives and dies with this row; see snapshotMatchMemo.
+	// +noKrtEquals derived from the fields above and the snapshot's other inputs
+	matchMemo *snapshotMatchMemo
 }
 
 func (c clustersWithErrors) ResourceName() string {
@@ -472,6 +476,7 @@ func assemblePerClientClusters(ucc ir.UniquelyConnectedClient, rows []uccWithClu
 		erroredClustersHash: erroredClustersHash,
 		perClientErrors:     perClientErrors,
 		resourceName:        ucc.ResourceName(),
+		matchMemo:           new(snapshotMatchMemo),
 	}
 }
 
